@@ -82,6 +82,12 @@ except Exception as _lc_err:  # pragma: no cover
     _LINECHECK_ERR = str(_lc_err)
 
 try:
+    import faces as facemod      # 平面图分面：按「面」找最窄通道
+except Exception as _f_err:      # pragma: no cover
+    facemod = None
+    _FACES_ERR = str(_f_err)
+
+try:
     import colors as colorname   # 颜色名映射卡
 except Exception as _cn_err:     # pragma: no cover
     colorname = None
@@ -1589,14 +1595,34 @@ class CdrBridge(object):
         if eps_mm:
             kw["eps_mm"] = float(eps_mm)
         issues = linecheck.analyze(self._line_geo, mode, thr_mm, boundary_layers=refs, **kw)
-        # 线段-线段近缝（智能填充串区的主因），全局找，不区分子模式
-        try:
-            gaps = linecheck.analyze_gaps(self._line_geo, thr_mm,
-                                          eps_mm=float(eps_mm or linecheck.EPS_MM))
-        except Exception as exc:
-            log("近缝检测失败: %r" % (exc,))
-            gaps = []
-        allx = list(issues) + list(gaps)
+        # 窄颈检测：优先用「分面」法（按智能填色的原理，一个面里找窄通道），
+        # 拿不到面（比如没有闭合外框）再退回逐对线段比较。
+        gaps = []
+        self._faces_n = 0
+        if facemod is not None:
+            try:
+                gaps, nf = facemod.find_pinches(
+                    self._line_geo, thr_mm,
+                    eps_mm=float(eps_mm or linecheck.EPS_MM))
+                self._faces_n = nf
+                log("分面: %d 个面, 窄颈 %d 处" % (nf, len(gaps)))
+            except Exception as exc:
+                log("分面检测失败: %r" % (exc,))
+                gaps = []
+        if not gaps:
+            try:
+                gaps = linecheck.analyze_gaps(self._line_geo, thr_mm,
+                                              eps_mm=float(eps_mm or linecheck.EPS_MM))
+                self._faces_n = 0
+            except Exception as exc:
+                log("近缝检测失败: %r" % (exc,))
+                gaps = []
+        # 分面成功时，真正会漏的地方必然表现为「面内窄颈」，
+        # 端点类清单就成了重复项 —— 只报窄颈，避免无谓修复。
+        if getattr(self, "_faces_n", 0) >= 2 and gaps:
+            allx = list(gaps)
+        else:
+            allx = list(issues) + list(gaps)
         allx.sort(key=lambda x: (x.get("kind") != "gap", x["dist_mm"]))
         for i, it in enumerate(allx, 1):
             it["no"] = i
@@ -3260,7 +3286,9 @@ class FloatWindow(object):
                 pass
             self.set_status("已取消标注（检测结果未保留）", "warn", hold=8)
             return
-        self.set_status("%s：%d 处未闭合，已标红圈" % (title, len(issues)), "ok", hold=10)
+        nf = getattr(self.bridge, "_faces_n", 0)
+        self.set_status("%s：%d 处%s" % (title, len(issues),
+                                        ("（分面 %d 个）" % nf) if nf else ""), "ok", hold=10)
         self._open_review(issues, mode, thr, n_mark)
 
     def _apply_all(self, issues, win=None):
