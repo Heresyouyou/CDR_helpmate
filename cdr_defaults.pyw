@@ -695,7 +695,24 @@ class CdrBridge(object):
             return False, "连接 CorelDRAW 失败"
 
         try:
-            if int(self.app.Documents.Count) == 0:
+            n_docs = int(self.app.Documents.Count)
+        except Exception:
+            n_docs = -1
+        if n_docs == 0 and HAS_PSUTIL:
+            # 有文档却连出 0 个，多半是连到了后台 /Auto 残留实例
+            n_proc = 0
+            try:
+                for p in psutil.process_iter(["name"]):
+                    if p.info["name"] and "CorelDRW" in p.info["name"]:
+                        n_proc += 1
+            except Exception:
+                n_proc = 0
+            if n_proc >= 2:
+                self.connected = False
+                return False, ("连到的是后台残留实例（共 %d 个 CorelDRAW），"
+                               "请在任务管理器里结束多余的那个再点重连" % n_proc)
+        try:
+            if n_docs == 0:
                 self.doc = None
                 self.connected = True
                 self.doc_name = ""
