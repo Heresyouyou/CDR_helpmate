@@ -136,7 +136,26 @@ def _already_joined(by_key, ka, kb, pt, radius):
     return False
 
 
-def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5, join_radius=0.8):
+def _cluster(gaps, dist_mm=0.3):
+    """同一处最窄通道只保留一个代表（距离最近的那个），其余记为重复。"""
+    kept = []
+    for g in gaps:
+        p = g["pt"]
+        hit = None
+        for k in kept:
+            if math.hypot(k["pt"][0] - p[0], k["pt"][1] - p[1]) <= dist_mm:
+                hit = k
+                break
+        if hit is None:
+            g["cluster_n"] = 1
+            kept.append(g)
+        else:
+            hit["cluster_n"] = hit.get("cluster_n", 1) + 1
+    return kept
+
+
+def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5, join_radius=0.8,
+                 cluster_mm=0.3):
     """线段-线段近缝：两条线最近距离在 (eps, thr] 之间却没相交。
 
     这是「智能填充串区」的主因——交点错开零点几丝，填充从针眼漏到隔壁。
@@ -227,7 +246,7 @@ def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5, join_radius=0.8):
                     "reason": "",
                 })
     out.sort(key=lambda x: x["dist_mm"])
-    return out
+    return _cluster(out, cluster_mm)
 
 
 # ---------------------------------------------------------------- 主检测

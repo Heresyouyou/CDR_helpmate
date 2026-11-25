@@ -1766,6 +1766,50 @@ class CdrBridge(object):
             raise RuntimeError("没找到刚插入的节点")
         best[1].SetPosition(self.mm_to_doc(new_pt[0]), self.mm_to_doc(new_pt[1]))
 
+    def _extend_end_to_line(self, sh, sub_idx, other_pt, max_mm=0.5):
+        """把 sh 上离 other_pt 最近的那个端点，直接延长到 other_pt（同一条轨迹上追加）。"""
+        try:
+            if int(sh.Type) != 3:
+                sh.ConvertToCurves()
+            sp = sh.Curve.SubPaths.Item(sub_idx + 1)
+            if bool(sp.Closed):
+                return None
+            n = int(sp.Nodes.Count)
+            best = None
+            for end, idx in ((1, n), (0, 1)):
+                nd = sp.Nodes.Item(idx)
+                d = math.hypot(nd.PositionX - other_pt[0], nd.PositionY - other_pt[1])
+                if best is None or d < best[0]:
+                    best = (d, end)
+            if best is None or best[0] > self.mm_to_doc(max_mm):
+                return None
+            if best[0] <= self.mm_to_doc(0.001):
+                return 0.0
+            if best[1] == 1:
+                sp.AppendLineSegment(other_pt[0], other_pt[1])
+            else:
+                sp.AppendLineSegment(other_pt[0], other_pt[1], True)
+            return self.doc_to_mm(best[0])
+        except Exception as exc:
+            log("延长线端失败: %r" % (exc,))
+            return None
+
+    def fix_gap(self, it):
+        """近缝修复：优先延长线端，其次节点吸附。"""
+        pa = (self.mm_to_doc(it["a_pt"][0]), self.mm_to_doc(it["a_pt"][1]))
+        pb = (self.mm_to_doc(it["b_pt"][0]), self.mm_to_doc(it["b_pt"][1]))
+        a_sh = self._resolve(it["a_layer"], it["a_addr"])
+        if a_sh is not None:
+            r = self._extend_end_to_line(a_sh, it["a_sub"], pb)
+            if r is not None:
+                return True, "已延长线端 %.3f mm" % (it.get("dist_mm") or 0)
+        b_sh = self._resolve(it["b_layer"], it["b_addr"])
+        if b_sh is not None:
+            r = self._extend_end_to_line(b_sh, it["b_sub"], pa)
+            if r is not None:
+                return True, "已延长线端 %.3f mm" % (it.get("dist_mm") or 0)
+        return self.snap_issue(it)
+
     def snap_issue(self, it):
         """近缝修复：不新增对象、不断开轨迹。
 
@@ -3265,7 +3309,7 @@ class FloatWindow(object):
                 dlg.set(i / float(n), "处理 %d/%d" % (i + 1, n))
                 dlg.check()
                 if it.get("kind") == "gap":
-                    good, msg = self.bridge.snap_issue(it)
+                    good, msg = self.bridge.fix_gap(it)
                 else:
                     good, msg = self.bridge.extend_issue(it)
                 if good:
@@ -3400,7 +3444,7 @@ class FloatWindow(object):
             if not it:
                 return
             if it.get("kind") == "gap":
-                ok, msg = self.bridge.snap_issue(it)
+                ok, msg = self.bridge.fix_gap(it)
                 self.set_status(msg, "ok" if ok else "bad", hold=6)
                 if ok:
                     items.pop(cur["i"])
