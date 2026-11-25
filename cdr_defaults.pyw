@@ -50,6 +50,7 @@ try:
     import win32gui
     import win32api
     import win32con
+    import win32process
     HAS_WIN32UI = True
 except Exception:
     HAS_WIN32UI = False
@@ -439,6 +440,92 @@ def acquire_single_instance():
         return -1
 
 
+def cdr_pids():
+    """活着的 CorelDRAW 进程（排除僵尸/已退出未回收的）。"""
+    if not HAS_PSUTIL:
+        return []
+    out = []
+    for p in psutil.process_iter(["pid", "name", "status"]):
+        if "CorelDRW" not in (p.info.get("name") or ""):
+            continue
+        if p.info.get("status") == psutil.STATUS_ZOMBIE:
+            continue
+        try:
+            if not p.is_running():
+                continue
+        except Exception:
+            continue
+        out.append(p.info["pid"])
+    return out
+
+
+def has_windowed_cdr():
+    """有没有一个带可见窗口的 CorelDRAW（= 用户真正在用的那个）。"""
+    visible = set()
+    try:
+        def cb(h, _):
+            try:
+                if win32gui.IsWindowVisible(h):
+                    visible.add(win32process.GetWindowThreadProcessId(h)[1])
+            except Exception:
+                pass
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        return bool(cdr_pids())
+    return bool(visible & set(cdr_pids()))
+
+
+def headless_cdr_pids(min_age=20):
+    """只认「命令行带 /Auto 且没有可见窗口」的自动化实例。
+
+    用户自己开出来的 CorelDRAW 一律不碰——宁可让他手动关，也不能误杀正在编辑的文件。
+    """
+    if not HAS_PSUTIL:
+        return []
+    visible = set()
+    try:
+        def cb(h, _):
+            try:
+                if win32gui.IsWindowVisible(h):
+                    visible.add(win32process.GetWindowThreadProcessId(h)[1])
+            except Exception:
+                pass
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        return []
+    now = time.time()
+    out = []
+    for p in psutil.process_iter(["pid", "name", "create_time", "cmdline"]):
+        nm = p.info.get("name") or ""
+        if "CorelDRW" not in nm:
+            continue
+        if p.info["pid"] in visible:
+            continue
+        cmd = " ".join(p.info.get("cmdline") or []).lower()
+        if "/auto" not in cmd:
+            continue
+        try:
+            if now - float(p.info["create_time"]) < min_age:
+                continue
+        except Exception:
+            pass
+        out.append(p.info["pid"])
+    return out
+
+
+def kill_pids(pids):
+    n = 0
+    for pid in pids:
+        try:
+            p = psutil.Process(pid)
+            p.kill()
+            n += 1
+            log("结束无窗口的 CorelDRAW 残留实例 pid=%s" % pid)
+        except Exception:
+            pass
+    return n
+
+
 def find_app_window():
     found = []
 
@@ -682,6 +769,18 @@ class CdrBridge(object):
         if running is False and not self.connected:
             return False, "CorelDRAW 未运行，请先打开"
 
+        # 只有「带可见窗口」的实例才是用户真正在用的。
+        # 没有窗口时：清掉 /Auto 自动化残留，但绝不碰用户自己开的实例。
+        if not has_windowed_cdr():
+            auto = headless_cdr_pids()
+            killed = kill_pids(auto) if auto else 0
+            if killed:
+                time.sleep(0.4)
+            if not has_windowed_cdr():
+                self.connected = False
+                return False, ("CorelDRAW 窗口还没就绪%s，请稍后重试"
+                               % (("（已清理 %d 个自动化残留）" % killed) if killed else ""))
+
         try:
             pythoncom.CoInitialize()
         except Exception:
@@ -698,25 +797,12 @@ class CdrBridge(object):
             n_docs = int(self.app.Documents.Count)
         except Exception:
             n_docs = -1
-        if n_docs == 0 and HAS_PSUTIL:
-            # 有文档却连出 0 个，多半是连到了后台 /Auto 残留实例
-            n_proc = 0
-            try:
-                for p in psutil.process_iter(["name"]):
-                    if p.info["name"] and "CorelDRW" in p.info["name"]:
-                        n_proc += 1
-            except Exception:
-                n_proc = 0
-            if n_proc >= 2:
-                self.connected = False
-                return False, ("连到的是后台残留实例（共 %d 个 CorelDRAW），"
-                               "请在任务管理器里结束多余的那个再点重连" % n_proc)
+        if n_docs <= 0:
+            self.doc = None
+            self.connected = True
+            self.doc_name = ""
+            return True, "已连接 · 等待文档"
         try:
-            if n_docs == 0:
-                self.doc = None
-                self.connected = True
-                self.doc_name = ""
-                return True, "已连接 · 无打开文档"
             self.doc = self.app.ActiveDocument
             self.doc_name = str(self.doc.Name)
             self.connected = True
@@ -2874,7 +2960,7 @@ class FloatWindow(object):
         self._label(head, "线条检测", fg=MUTED, font=FONT_S).pack(side="left")
 
         # 右侧从右往左：下限 [0.01] · 上限 [0.05] mm
-        self.eps_var = tk.StringVar(value="%g" % float(self.cfg.get("eps_mm", 0.01)))
+        self.eps_var = tk.StringVar(value="%g" % float(self.cfg.get("eps_mm", 0.005)))
         self.eps_entry = tk.Entry(head, textvariable=self.eps_var, font=FONT_S, width=4,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
@@ -2882,7 +2968,7 @@ class FloatWindow(object):
         self.eps_entry.pack(side="right", ipady=2)
         self._label(head, "下限", fg=MUTED, font=FONT_S).pack(side="right", padx=(0, 2))
 
-        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.2)))
+        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.05)))
         self.thr_entry = tk.Entry(head, textvariable=self.thr_var, font=FONT_S, width=4,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
@@ -3010,7 +3096,7 @@ class FloatWindow(object):
         try:
             v = float(self.eps_var.get().strip())
         except Exception:
-            v = 0.01
+            v = 0.005
         v = max(0.0, min(1.0, v))
         self.eps_var.set("%g" % v)
         try:
@@ -3024,7 +3110,7 @@ class FloatWindow(object):
         try:
             v = float(self.thr_var.get().strip())
         except Exception:
-            v = 0.2
+            v = 0.05
         v = max(0.005, min(20.0, v))
         self.thr_var.set("%g" % v)
         try:
