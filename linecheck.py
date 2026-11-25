@@ -165,10 +165,25 @@ def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5):
                 l2 = math.hypot(*v2) or 1e-9
                 cos = abs(v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
                 ang = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+                la = math.hypot(a2[0] - a1[0], a2[1] - a1[1])
+                lb = math.hypot(b2[0] - b1[0], b2[1] - b1[1])
+                # 吸附在哪条线上：挑「这一段更长」的那条（同样位移下角度变化更小）
+                if la >= lb:
+                    snap_on = "a"
+                    snap_layer, snap_addr, snap_sub = ka[0], list(ka[1]), ka[2]
+                    snap_from, snap_to = pa, pb
+                else:
+                    snap_on = "b"
+                    snap_layer, snap_addr, snap_sub = kb[0], list(kb[1]), kb[2]
+                    snap_from, snap_to = pb, pa
                 out.append({
                     "kind": "gap",
                     "a_layer": ka[0], "a_addr": list(ka[1]), "a_sub": ka[2],
                     "b_layer": kb[0], "b_addr": list(kb[1]), "b_sub": kb[2],
+                    "snap_on": snap_on,
+                    "snap_layer": snap_layer, "snap_addr": snap_addr, "snap_sub": snap_sub,
+                    "snap_from": (round(snap_from[0], 4), round(snap_from[1], 4)),
+                    "snap_to": (round(snap_to[0], 4), round(snap_to[1], 4)),
                     "a_pt": (round(pa[0], 4), round(pa[1], 4)),
                     "b_pt": (round(pb[0], 4), round(pb[1], 4)),
                     "dist_mm": round(d, 4),
