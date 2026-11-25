@@ -78,6 +78,114 @@ def polyline_length(pts):
     return n
 
 
+def _seg_dist_pair(a1, a2, b1, b2):
+    """两线段最短距离；相交返回 0。"""
+    d1 = (a2[0] - a1[0], a2[1] - a1[1])
+    d2 = (b2[0] - b1[0], b2[1] - b1[1])
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(den) > 1e-15:
+        t = ((b1[0] - a1[0]) * d2[1] - (b1[1] - a1[1]) * d2[0]) / den
+        u = ((b1[0] - a1[0]) * d1[1] - (b1[1] - a1[1]) * d1[0]) / den
+        if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
+            return 0.0
+
+    def seg_pt(p, s1, s2):
+        vx, vy = s2[0] - s1[0], s2[1] - s1[1]
+        l2 = vx * vx + vy * vy
+        if l2 <= 1e-18:
+            return math.hypot(p[0] - s1[0], p[1] - s1[1])
+        tt = ((p[0] - s1[0]) * vx + (p[1] - s1[1]) * vy) / l2
+        tt = 0.0 if tt < 0 else (1.0 if tt > 1 else tt)
+        return math.hypot(p[0] - (s1[0] + tt * vx), p[1] - (s1[1] + tt * vy))
+
+    return min(seg_pt(a1, b1, b2), seg_pt(a2, b1, b2),
+               seg_pt(b1, a1, a2), seg_pt(b2, a1, a2))
+
+
+def closest_pair(a1, a2, b1, b2):
+    """两线段之间的最近点对 (p, q)。"""
+    cands = [(a1, foot_on_seg(a1, b1, b2)), (a2, foot_on_seg(a2, b1, b2)),
+             (foot_on_seg(b1, a1, a2), b1), (foot_on_seg(b2, a1, a2), b2)]
+    best = None
+    for p, q in cands:
+        d = math.hypot(p[0] - q[0], p[1] - q[1])
+        if best is None or d < best[0]:
+            best = (d, p, q)
+    return best[1], best[2], best[0]
+
+
+def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5):
+    """线段-线段近缝：两条线最近距离在 (eps, thr] 之间却没相交。
+
+    这是「智能填充串区」的主因——交点错开零点几丝，填充从针眼漏到隔壁。
+    """
+    segs = []
+    for layer, paths in geo.items():
+        for pi, p in enumerate(paths):
+            pts = p["pts"]
+            key = (layer, tuple(p["addr"]), p["sub"])
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6:
+                    segs.append((key, a, b))
+    if not segs:
+        return []
+
+    grid = {}
+    for idx, (_k, a, b) in enumerate(segs):
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+            for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                grid.setdefault((gx, gy), []).append(idx)
+
+    out = []
+    seen = set()
+    for ids in grid.values():
+        n = len(ids)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ia, ib = ids[i], ids[j]
+                if ia > ib:
+                    ia, ib = ib, ia
+                if (ia, ib) in seen:
+                    continue
+                seen.add((ia, ib))
+                ka, a1, a2 = segs[ia]
+                kb, b1, b2 = segs[ib]
+                if ka == kb:
+                    continue
+                d = _seg_dist_pair(a1, a2, b1, b2)
+                if d <= eps_mm or d > thr_mm:
+                    continue
+                pa, pb, _ = closest_pair(a1, a2, b1, b2)
+                v1 = (a2[0] - a1[0], a2[1] - a1[1])
+                v2 = (b2[0] - b1[0], b2[1] - b1[1])
+                l1 = math.hypot(*v1) or 1e-9
+                l2 = math.hypot(*v2) or 1e-9
+                cos = abs(v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
+                ang = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+                out.append({
+                    "kind": "gap",
+                    "a_layer": ka[0], "a_addr": list(ka[1]), "a_sub": ka[2],
+                    "b_layer": kb[0], "b_addr": list(kb[1]), "b_sub": kb[2],
+                    "a_pt": (round(pa[0], 4), round(pa[1], 4)),
+                    "b_pt": (round(pb[0], 4), round(pb[1], 4)),
+                    "dist_mm": round(d, 4),
+                    "angle": round(ang, 1),
+                    "parallel": ang < 5.0,
+                    "layer": ka[0],
+                    "pt": (round((pa[0] + pb[0]) / 2, 4), round((pa[1] + pb[1]) / 2, 4)),
+                    "end": -1,
+                    "mode": "bridge",
+                    "extend_to": (round(pb[0], 4), round(pb[1], 4)),
+                    "extend_len_mm": round(d, 4),
+                    "reason": "",
+                })
+    out.sort(key=lambda x: x["dist_mm"])
+    return out
+
+
 # ---------------------------------------------------------------- 主检测
 
 def analyze(geo, mode, thr_mm, boundary_layers=("边界",), eps_mm=EPS_MM,

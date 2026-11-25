@@ -1503,9 +1503,18 @@ class CdrBridge(object):
         if eps_mm:
             kw["eps_mm"] = float(eps_mm)
         issues = linecheck.analyze(self._line_geo, mode, thr_mm, boundary_layers=refs, **kw)
-        for i, it in enumerate(issues, 1):
+        # 线段-线段近缝（智能填充串区的主因），全局找，不区分子模式
+        try:
+            gaps = linecheck.analyze_gaps(self._line_geo, thr_mm,
+                                          eps_mm=float(eps_mm or linecheck.EPS_MM))
+        except Exception as exc:
+            log("近缝检测失败: %r" % (exc,))
+            gaps = []
+        allx = list(issues) + list(gaps)
+        allx.sort(key=lambda x: (x.get("kind") != "gap", x["dist_mm"]))
+        for i, it in enumerate(allx, 1):
             it["no"] = i
-        return issues, ""
+        return allx, ""
 
     def layer_names(self):
         out = []
@@ -1603,7 +1612,125 @@ class CdrBridge(object):
             return True, "方向偏了，已用垂线补齐 %.2f mm" % (it.get("extend_len_mm") or 0)
         return True, "已延长 %.2f mm" % (it.get("extend_len_mm") or 0)
 
+    # ---- 线段近缝：插节点 + 建桥接线 ---------------------------
+
+    def _polyline_pts(self, sh, sub_idx):
+        c = sh.Curve
+        sp = c.SubPaths.Item(sub_idx + 1)
+        pts = []
+        try:
+            info = sp.GetCurveInfo()
+            for nd in info:
+                pts.append((float(nd.PositionX), float(nd.PositionY)))
+        except Exception:
+            nodes = sp.Nodes
+            for k in range(1, int(nodes.Count) + 1):
+                nd = nodes.Item(k)
+                pts.append((float(nd.PositionX), float(nd.PositionY)))
+        return sp, pts
+
+    @staticmethod
+    def _offset_to_point(pts, pt):
+        """沿折线累计长度，返回最近投影点的 (距离, 绝对偏移)。"""
+        best = None
+        off = 0.0
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            l2 = dx * dx + dy * dy
+            seg_len = math.sqrt(l2) if l2 > 0 else 0.0
+            if l2 <= 1e-18:
+                continue
+            t = ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / l2
+            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+            px, py = a[0] + t * dx, a[1] + t * dy
+            d = math.hypot(pt[0] - px, pt[1] - py)
+            if best is None or d < best[0]:
+                best = (d, off + t * seg_len)
+            off += seg_len
+        return best if best else (1e9, 0.0)
+
+    def _insert_node(self, sh, sub_idx, pt_mm):
+        """在指定点插一个节点（几何不变）。已在该处则不重复插。"""
+        if int(sh.Type) != 3:
+            sh.ConvertToCurves()
+        sp, pts = self._polyline_pts(sh, sub_idx)
+        tgt = (self.mm_to_doc(pt_mm[0]), self.mm_to_doc(pt_mm[1]))
+        near = self.mm_to_doc(0.002)
+        for p in pts:
+            if math.hypot(p[0] - tgt[0], p[1] - tgt[1]) <= near:
+                return False
+        _d, off = self._offset_to_point(pts, tgt)
+        sp.AddNodeAt(off, 0)
+        return True
+
+    BRIDGE_LAYER = "闭合补线"
+
+    def _bridge_layer(self):
+        """桥接线统一放独立图层：新建对象会插到图层顶部，
+        放原图层会把同层其它对象的索引全部顶偏，后续地址就失效了。"""
+        try:
+            return self.doc.ActivePage.Layers.Item(self.BRIDGE_LAYER)
+        except Exception:
+            pass
+        try:
+            return self.doc.ActivePage.CreateLayer(self.BRIDGE_LAYER)
+        except Exception:
+            return None
+
+    def bridge_issue(self, it):
+        """两条线之间补一条短线段（两端各插节点），让它们真正相交。"""
+        a = self._resolve(it["a_layer"], it["a_addr"])
+        b = self._resolve(it["b_layer"], it["b_addr"])
+        if a is None or b is None:
+            return False, "找不到线条"
+        try:
+            self._insert_node(a, it["a_sub"], it["a_pt"])
+            self._insert_node(b, it["b_sub"], it["b_pt"])
+        except Exception as exc:
+            log("插节点失败: %r" % (exc,))
+        pa = (self.mm_to_doc(it["a_pt"][0]), self.mm_to_doc(it["a_pt"][1]))
+        pb = (self.mm_to_doc(it["b_pt"][0]), self.mm_to_doc(it["b_pt"][1]))
+        try:
+            layer = self._bridge_layer()
+            if layer is None:
+                return False, "建不了「闭合补线」图层"
+            seg = layer.CreateLineSegment(pa[0], pa[1], pb[0], pb[1])
+        except Exception as exc:
+            return False, "建桥接线失败：%s" % exc
+        try:
+            seg.Outline.Width = a.Outline.Width
+        except Exception:
+            pass
+        try:
+            seg.Outline.Color.CopyAssign(a.Outline.Color)
+        except Exception:
+            try:
+                seg.Outline.Color.HexValue = str(a.Outline.Color.HexValue)
+            except Exception:
+                pass
+        try:
+            seg.Outline.Style.CopyAssign(a.Outline.Style)
+        except Exception:
+            pass
+        return True, "已桥接 %.3f mm" % (it.get("dist_mm") or 0)
+
     def select_shape(self, it):
+        if it.get("kind") == "gap":
+            ok = False
+            for lay, addr in ((it["a_layer"], it["a_addr"]), (it["b_layer"], it["b_addr"])):
+                sh = self._resolve(lay, addr)
+                if sh is None:
+                    continue
+                try:
+                    if not ok:
+                        sh.CreateSelection()
+                        ok = True
+                    else:
+                        sh.AddToSelection()
+                except Exception:
+                    pass
+            return ok
         sh = self._resolve(it["layer"], it["addr"])
         if sh is None:
             return False
@@ -2780,6 +2907,15 @@ class FloatWindow(object):
             w.bind("<Enter>", lambda e, x=w: x.config(bg=CHIP_HOVER))
             w.bind("<Leave>", lambda e, x=w: x.config(bg=CHIP_BG))
 
+        row2 = tk.Frame(parent, bg=BG)
+        row2.pack(fill="x", pady=(6, 0))
+        self.btn_closeall = tk.Label(row2, text="一键闭合（全部补上）", bg=ACCENT,
+                                     fg="#FFFFFF", font=FONT_S, pady=7, cursor="hand2")
+        self.btn_closeall.pack(fill="x")
+        self.btn_closeall.bind("<Button-1>", lambda e: self._close_all())
+        self.btn_closeall.bind("<Enter>", lambda e: self.btn_closeall.config(bg=ACCENT_HOVER))
+        self.btn_closeall.bind("<Leave>", lambda e: self.btn_closeall.config(bg=ACCENT))
+
         self.ref_lb = tk.Label(parent, text="", bg=BG, fg=ACCENT, font=FONT_S,
                                anchor="w", cursor="hand2")
         self.ref_lb.pack(fill="x", pady=(6, 0))
@@ -3010,6 +3146,109 @@ class FloatWindow(object):
         self.set_status("%s：%d 处未闭合，已标红圈" % (title, len(issues)), "ok", hold=10)
         self._open_review(issues, mode, thr, n_mark)
 
+    def _close_all(self):
+        """一键闭合：全图找所有未闭合处（端点+线段近缝），逐条补上。"""
+        if self._busy:
+            return
+        if not self.bridge.connected and not self.bridge.attach()[0]:
+            self.set_status("未连接 CorelDRAW", "bad")
+            return
+        if not self.bridge.ensure_doc():
+            self.set_status("没有打开的文档", "warn")
+            return
+        thr = self._thr_mm()
+        eps = self._eps_mm()
+        if not messagebox.askyesno(
+                "一键闭合",
+                "会先全图重扫一遍（约 1 分钟，已缓存则很快），然后自动处理：\n\n"
+                "· 端点没接上的 → 延长 / 垂线补齐\n"
+                "· 两条线只差几丝的 → 插节点并桥接\n"
+                "· 疑似重复的并行线只报告、不自动处理\n\n"
+                "阈值 %.2fmm，下限 %.3fmm。动手前会自动备份。\n\n继续？"
+                % (thr, eps)):
+            return
+
+        dlg = ProgressDialog(self, "一键闭合", "正在重新检测…")
+        self._busy = True
+        try:
+            def prog(frac, text):
+                dlg.set(frac * 0.35, text)
+                dlg.check()
+            issues, err = self.bridge.scan_lines("global", thr, ref_layers=None,
+                                                 progress=prog, eps_mm=eps)
+        except Cancelled:
+            dlg.close()
+            self._busy = False
+            self.set_status("已取消", "warn", hold=5)
+            return
+        finally:
+            self._busy = False
+        if not issues:
+            dlg.close()
+            self.set_status(err or "没有需要闭合的地方", "ok", hold=6)
+            return
+
+        targets = [i for i in issues if i.get("kind") != "gap" or not i.get("parallel")]
+        skipped_par = len(issues) - len(targets)
+        if not targets:
+            dlg.close()
+            messagebox.showinfo("一键闭合", "只发现 %d 处疑似重复线，已跳过。" % skipped_par)
+            return
+
+        self._backup_for_batch("一键闭合")
+        ok = fail = 0
+        errs = []
+        cancelled = False
+        self._busy = True
+        try:
+            try:
+                self.bridge.doc.BeginCommandGroup("一键闭合")
+            except Exception:
+                pass
+            n = len(targets)
+            for i, it in enumerate(targets):
+                dlg.set(0.35 + 0.65 * i / n, "处理 %d/%d" % (i + 1, n))
+                dlg.check()
+                if it.get("kind") == "gap":
+                    good, msg = self.bridge.bridge_issue(it)
+                else:
+                    good, msg = self.bridge.extend_issue(it)
+                if good:
+                    ok += 1
+                else:
+                    fail += 1
+                    if len(errs) < 5:
+                        errs.append("%s：%s" % (it.get("layer", ""), msg))
+            try:
+                self.bridge.doc.EndCommandGroup()
+            except Exception:
+                pass
+        except Cancelled:
+            cancelled = True
+            try:
+                self.bridge.doc.EndCommandGroup()
+            except Exception:
+                pass
+        finally:
+            self._busy = False
+            dlg.close()
+
+        self._line_geo = None                     # 几何变了，下次重扫
+        try:
+            self.bridge.clear_marks()
+        except Exception:
+            pass
+        head = "已取消，" if cancelled else ""
+        self.set_status("%s闭合 %d 处，失败 %d 处" % (head, ok, fail),
+                        "ok" if not fail else "warn", hold=10)
+        detail = "%s一键闭合完成：成功 %d，失败 %d" % (head, ok, fail)
+        if skipped_par:
+            detail += "\n跳过疑似重复线 %d 处（建议人工核对）" % skipped_par
+        if errs:
+            detail += "\n\n失败示例：\n" + "\n".join(errs)
+        detail += "\n\n可用底栏「撤销」一次性回退。"
+        messagebox.showinfo("一键闭合", detail)
+
     def _open_review(self, issues, mode, thr, n_mark):
         title = "边界检测" if mode == "boundary" else "全图闭合检测"
         win = tk.Toplevel(self.root)
@@ -3044,10 +3283,15 @@ class FloatWindow(object):
         cur = {"i": 0, "backed": False}
 
         def fmt(it):
-            mark = (" " if it.get("mode") == "ray"
-                    else ("⊥" if it.get("mode") == "perp" else "×"))
-            return "%s%02d  %-8s %-3s %5.2fmm  (%.1f, %.1f)" % (
-                mark, it["no"], it["layer"], "尾端" if it["end"] else "首端",
+            if it.get("kind") == "gap":
+                mark = "∥" if it.get("parallel") else "＋"
+                tail = "两线之间"
+            else:
+                mark = (" " if it.get("mode") == "ray"
+                        else ("⊥" if it.get("mode") == "perp" else "×"))
+                tail = "尾端" if it["end"] else "首端"
+            return "%s%02d  %-8s %-6s %5.3fmm  (%.1f, %.1f)" % (
+                mark, it["no"], it["layer"], tail,
                 it["dist_mm"], it["pt"][0], it["pt"][1])
 
         def refresh():
@@ -3082,6 +3326,14 @@ class FloatWindow(object):
         def do_extend():
             it = current()
             if not it:
+                return
+            if it.get("kind") == "gap":
+                ok, msg = self.bridge.bridge_issue(it)
+                self.set_status(msg, "ok" if ok else "bad", hold=6)
+                if ok:
+                    items.pop(cur["i"])
+                    refresh()
+                    on_select()
                 return
             if not it.get("extend_to"):
                 messagebox.showwarning(
