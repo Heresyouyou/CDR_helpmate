@@ -114,7 +114,29 @@ def closest_pair(a1, a2, b1, b2):
     return best[1], best[2], best[0]
 
 
-def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5):
+def _already_joined(by_key, ka, kb, pt, radius):
+    """两条子路径是否在 pt 附近（radius 内）已经有相交/相接。
+
+    有的话，这个缝漏进去的只是一小片薄区（≤radius），肉眼看不出来，
+    属于「修不修都一样」的低风险项。
+    """
+    sa = by_key.get(ka) or []
+    sb = by_key.get(kb) or []
+    r2 = radius + 2.0
+    for (a1, a2) in sa:
+        if (min(math.hypot(a1[0] - pt[0], a1[1] - pt[1]),
+                math.hypot(a2[0] - pt[0], a2[1] - pt[1])) > r2):
+            continue
+        for (b1, b2) in sb:
+            if (min(math.hypot(b1[0] - pt[0], b1[1] - pt[1]),
+                    math.hypot(b2[0] - pt[0], b2[1] - pt[1])) > r2):
+                continue
+            if _seg_dist_pair(a1, a2, b1, b2) <= 0.001:
+                return True
+    return False
+
+
+def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5, join_radius=0.8):
     """线段-线段近缝：两条线最近距离在 (eps, thr] 之间却没相交。
 
     这是「智能填充串区」的主因——交点错开零点几丝，填充从针眼漏到隔壁。
@@ -130,6 +152,10 @@ def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5):
                     segs.append((key, a, b))
     if not segs:
         return []
+
+    by_key = {}
+    for (k, a, b) in segs:
+        by_key.setdefault(k, []).append((a, b))
 
     grid = {}
     for idx, (_k, a, b) in enumerate(segs):
@@ -176,8 +202,11 @@ def analyze_gaps(geo, thr_mm, eps_mm=EPS_MM, cell=0.5):
                     snap_on = "b"
                     snap_layer, snap_addr, snap_sub = kb[0], list(kb[1]), kb[2]
                     snap_from, snap_to = pb, pa
+                low = _already_joined(by_key, ka, kb, ((pa[0] + pb[0]) / 2,
+                                                       (pa[1] + pb[1]) / 2), join_radius)
                 out.append({
                     "kind": "gap",
+                    "low_risk": low,
                     "a_layer": ka[0], "a_addr": list(ka[1]), "a_sub": ka[2],
                     "b_layer": kb[0], "b_addr": list(kb[1]), "b_sub": kb[2],
                     "snap_on": snap_on,

@@ -3230,7 +3230,10 @@ class FloatWindow(object):
         gaps = [i for i in issues if i.get("kind") == "gap"]
         ends = [i for i in issues if i.get("kind") != "gap"]
         par = [i for i in gaps if i.get("parallel")]
-        targets = [i for i in issues if not (i.get("kind") == "gap" and i.get("parallel"))]
+        low = [i for i in gaps if i.get("low_risk") and not i.get("parallel")]
+        targets = [i for i in issues
+                   if not (i.get("kind") == "gap"
+                           and (i.get("parallel") or i.get("low_risk")))]
         if not targets:
             messagebox.showinfo("一键闭合", "剩下的都是疑似重复线，已跳过。")
             return
@@ -3239,9 +3242,11 @@ class FloatWindow(object):
                 "将对剩余 %d 处执行闭合：\n\n"
                 "· 端点未接 %d 处 → 延长 / 垂线补齐\n"
                 "· 两线近缝 %d 处 → 插节点吸附（不新增对象）\n"
-                "· 跳过疑似重复线 %d 处\n\n"
+                "· 跳过疑似重复线 %d 处\n"
+                "· 跳过低风险近缝 %d 处（两条线附近已经相交，漏进去的只是一薄片）\n\n"
                 "动手前会自动备份，完成后可用底栏「撤销」一次性回退。\n\n继续？"
-                % (len(targets), len(ends), len(gaps) - len(par), len(par))):
+                % (len(targets), len(ends), len(gaps) - len(par) - len(low),
+                   len(par), len(low))):
             return
 
         self._backup_for_batch("一键闭合")
@@ -3300,6 +3305,8 @@ class FloatWindow(object):
         detail = "%s一键闭合：成功 %d，失败 %d" % (head, ok, fail)
         if par:
             detail += "\n跳过疑似重复线 %d 处（建议人工核对）" % len(par)
+        if low:
+            detail += "\n跳过低风险近缝 %d 处" % len(low)
         if errs:
             detail += "\n\n失败示例：\n" + "\n".join(errs)
         detail += "\n\n可用底栏「撤销」一次性回退。"
@@ -3340,8 +3347,12 @@ class FloatWindow(object):
 
         def fmt(it):
             if it.get("kind") == "gap":
-                mark = "∥" if it.get("parallel") else "→"
-                tail = "两线之间"
+                if it.get("parallel"):
+                    mark, tail = "∥", "疑似重复"
+                elif it.get("low_risk"):
+                    mark, tail = "·", "低风险"
+                else:
+                    mark, tail = "→", "两线之间"
             else:
                 mark = (" " if it.get("mode") == "ray"
                         else ("⊥" if it.get("mode") == "perp" else "×"))
