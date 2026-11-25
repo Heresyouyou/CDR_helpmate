@@ -156,13 +156,14 @@ def log(msg):
 
 
 # ---------------------------------------------------------------- 版本与更新
-APP_VERSION = "1.1"
+APP_VERSION = "1.1.2"
 
 # 内网优先：先探 kust.work，通了就用内网源，不通才回落到公网 sjck.kust.work。
 # 两个地址都能用环境变量覆盖，方便调试或换镜像。
 UPDATE_PATH = "/cdr"
 UPDATE_LAN_URL = os.environ.get("CDR_UPDATE_LAN") or ("https://kust.work" + UPDATE_PATH)
 UPDATE_WAN_URL = os.environ.get("CDR_UPDATE_WAN") or ("https://sjck.kust.work" + UPDATE_PATH)
+FEEDBACK_URL = os.environ.get("CDR_FEEDBACK_URL") or "https://sjck.kust.work/feedback"
 UPDATE_TIMEOUT = 5.0
 LAN_PROBE_TIMEOUT = 1.2
 
@@ -1581,6 +1582,8 @@ class CdrBridge(object):
                     break
         except Exception:
             pass
+        if it.get("mode") == "perp":
+            return True, "方向偏了，已用垂线补齐 %.2f mm" % (it.get("extend_len_mm") or 0)
         return True, "已延长 %.2f mm" % (it.get("extend_len_mm") or 0)
 
     def select_shape(self, it):
@@ -2111,6 +2114,136 @@ class FloatWindow(object):
         except Exception as exc:
             log("从托盘显示失败: %r" % (exc,))
 
+    def _open_feedback(self):
+        """反馈 / 许愿：发到 sjck.kust.work 的留言板。"""
+        top = tk.Toplevel(self.root)
+        top.title("反馈 / 许愿")
+        top.configure(bg=BG)
+        top.attributes("-topmost", True)
+        top.resizable(False, False)
+
+        pad = tk.Frame(top, bg=BG)
+        pad.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(pad, text="问题反馈 / 功能许愿", bg=BG, fg=TXT, font=FONT_B).pack(anchor="w")
+        tk.Label(pad, text="会发到 sjck.kust.work 的留言板，我看到就会处理。",
+                 bg=BG, fg=MUTED, font=FONT_S).pack(anchor="w", pady=(2, 10))
+
+        kinds = {"v": "bug"}
+        krow = tk.Frame(pad, bg=BG)
+        krow.pack(fill="x", pady=(0, 8))
+        kb = {}
+
+        def paint_kind():
+            for k, w in kb.items():
+                on = kinds["v"] == k
+                w.config(bg=ACCENT_SOFT if on else CHIP_BG,
+                         fg=ACCENT if on else MUTED)
+
+        for k, label in (("bug", "问题反馈"), ("wish", "功能许愿")):
+            w = tk.Label(krow, text=label, font=FONT_S, padx=12, pady=5, cursor="hand2")
+            w.pack(side="left", padx=(0, 8))
+            kb[k] = w
+
+            def pick(e, key=k):
+                kinds["v"] = key
+                paint_kind()
+            w.bind("<Button-1>", pick)
+        paint_kind()
+
+        nrow = tk.Frame(pad, bg=BG)
+        nrow.pack(fill="x", pady=(0, 8))
+        tk.Label(nrow, text="称呼", bg=BG, fg=MUTED, font=FONT_S).pack(side="left")
+        name_var = tk.StringVar(value="")
+        tk.Entry(nrow, textvariable=name_var, font=FONT_S, relief="flat", bg=FIELD_BG,
+                 fg=TXT, insertbackground=TXT, highlightthickness=1,
+                 highlightbackground=LINE, highlightcolor=ACCENT).pack(
+            side="left", fill="x", expand=True, padx=(8, 0), ipady=3)
+
+        txt = tk.Text(pad, height=7, font=FONT_S, relief="flat", bg=FIELD_BG, fg=TXT,
+                      insertbackground=TXT, highlightthickness=1,
+                      highlightbackground=LINE, highlightcolor=ACCENT, wrap="word")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", "")
+        txt.focus_set()
+
+        st = tk.Label(pad, text="", bg=BG, fg=MUTED, font=FONT_S, anchor="w")
+        st.pack(fill="x", pady=(6, 0))
+
+        row = tk.Frame(pad, bg=BG)
+        row.pack(fill="x", pady=(8, 0))
+
+        def close():
+            top.destroy()
+
+        def send():
+            body = txt.get("1.0", "end").strip()
+            if not body:
+                st.config(text="先写点内容吧", fg=BAD)
+                return
+            btn_send.config(state="disabled", text="发送中…")
+            st.config(text="正在发送…", fg=MUTED)
+
+            def worker():
+                err = ""
+                try:
+                    payload = json.dumps({
+                        "text": body, "name": name_var.get().strip(),
+                        "kind": kinds["v"], "version": APP_VERSION,
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        FEEDBACK_URL, data=payload,
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "CDRHelper/%s" % APP_VERSION})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    if not data.get("ok"):
+                        err = data.get("error") or "服务器拒绝了这条留言"
+                except Exception as exc:
+                    err = "%s: %s" % (type(exc).__name__, str(exc)[:60])
+
+                def done():
+                    try:
+                        if err:
+                            btn_send.config(state="normal", text="发送")
+                            st.config(text="发送失败 · %s" % err, fg=BAD)
+                        else:
+                            st.config(text="已发送，谢谢！", fg=OK)
+                            txt.delete("1.0", "end")
+                            btn_send.config(state="normal", text="再发一条")
+                            self.set_status("反馈已发送", "ok", hold=5)
+                    except Exception:
+                        pass
+
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def open_board():
+            try:
+                webbrowser.open(FEEDBACK_URL)
+            except Exception:
+                pass
+
+        btn_send = tk.Label(row, text="发送", bg=ACCENT, fg="#FFFFFF", font=FONT_S,
+                            padx=18, pady=6, cursor="hand2")
+        btn_send.pack(side="right")
+        btn_send.bind("<Button-1>", lambda e: send())
+        tk.Label(row, text="看看留言板", bg=CHIP_BG, fg=TXT, font=FONT_S, padx=12, pady=6,
+                 cursor="hand2").pack(side="right", padx=(0, 8))
+        row.winfo_children()[-1].bind("<Button-1>", lambda e: open_board())
+        tk.Label(row, text="取消", bg=CHIP_BG, fg=TXT, font=FONT_S, padx=12, pady=6,
+                 cursor="hand2").pack(side="left")
+        row.winfo_children()[-1].bind("<Button-1>", lambda e: close())
+
+        top.protocol("WM_DELETE_WINDOW", close)
+        top.update_idletasks()
+        w, h = max(430, top.winfo_reqwidth()), max(360, top.winfo_reqheight())
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        top.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 2))
+
     def _build_verbar(self, parent):
         bar = tk.Frame(parent, bg=BG, height=VER_H)
         bar.pack(side="bottom", fill="x")
@@ -2173,6 +2306,8 @@ class FloatWindow(object):
         self.btn_redo = mk("⟳  重做", self._cdr_redo)
         tk.Frame(bar, bg=LINE, width=1).pack(side="left", fill="y")
         self.btn_clear = mk("⌫  清空缓存", self._clear_cache)
+        tk.Frame(bar, bg=LINE, width=1).pack(side="left", fill="y")
+        self.btn_fb = mk("✎  反馈", self._open_feedback)
 
     def _build_advanced(self, parent):
         bar = tk.Frame(parent, bg=BG)
@@ -2607,7 +2742,7 @@ class FloatWindow(object):
         self.eps_entry.pack(side="right", ipady=2)
         self._label(head, "下限", fg=MUTED, font=FONT_S).pack(side="right", padx=(0, 2))
 
-        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.05)))
+        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.2)))
         self.thr_entry = tk.Entry(head, textvariable=self.thr_var, font=FONT_S, width=4,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
@@ -2749,7 +2884,7 @@ class FloatWindow(object):
         try:
             v = float(self.thr_var.get().strip())
         except Exception:
-            v = 0.05
+            v = 0.2
         v = max(0.005, min(20.0, v))
         self.thr_var.set("%g" % v)
         try:
@@ -2892,8 +3027,10 @@ class FloatWindow(object):
         cur = {"i": 0, "backed": False}
 
         def fmt(it):
-            return "%02d  %-8s %-3s %5.2fmm  (%.1f, %.1f)" % (
-                it["no"], it["layer"], "尾端" if it["end"] else "首端",
+            mark = (" " if it.get("mode") == "ray"
+                    else ("⊥" if it.get("mode") == "perp" else "×"))
+            return "%s%02d  %-8s %-3s %5.2fmm  (%.1f, %.1f)" % (
+                mark, it["no"], it["layer"], "尾端" if it["end"] else "首端",
                 it["dist_mm"], it["pt"][0], it["pt"][1])
 
         def refresh():
@@ -2930,7 +3067,10 @@ class FloatWindow(object):
             if not it:
                 return
             if not it.get("extend_to"):
-                messagebox.showwarning("无法延长", "这一处的射线打不到参考线，需要手动处理。")
+                messagebox.showwarning(
+                    "无法自动延长",
+                    (it.get("reason") or "射线方向打不到参考线") +
+                    "\n\n这一处需要手动补，或用「跳过」略过。")
                 return
             if not cur.get("backed"):
                 self._backup_for_batch("线条延长")

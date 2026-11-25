@@ -49,6 +49,19 @@ def ray_seg_hit(p, d, a, b):
     return None
 
 
+def foot_on_seg(p, a, b):
+    """点在直线段上的垂足（夹在段内）。"""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    if l2 <= 1e-18:
+        return a
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / l2
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return (ax + t * dx, ay + t * dy)
+
+
 def segments_of(pts, closed):
     segs = []
     for i in range(len(pts) - 1):
@@ -118,23 +131,45 @@ def analyze(geo, mode, thr_mm, boundary_layers=("边界",), eps_mm=EPS_MM,
                 if n < 1e-9:
                     dx, dy, n = 1.0, 0.0, 1.0
                 dx, dy = dx / n, dy / n
+                # 沿「前一个节点 → 端点」的射线找**最先**碰到的线段；
+                # 只接受 ≤ 阈值 的延伸距离 —— 碰到就截止，绝不无限延伸。
                 hit = None
+                first_t = None
                 for (rl, raddr, ridx, a, b) in refs:
                     if rl == lname and raddr == tuple(sp["addr"]) and ridx == idx:
                         continue
                     t = ray_seg_hit(e, (dx, dy), a, b)
-                    if t is None or t * n > max_extend_mm:
+                    if t is None:
+                        continue
+                    if first_t is None or t < first_t:
+                        first_t = t
+                    if t > thr_mm:
                         continue
                     if hit is None or t < hit[0]:
                         hit = (t, rl, a, b)
                 extend_to = None
                 extend_len = None
+                mode = ""
+                reason = ""
                 ref_layer = best[1]
                 ref_addr = best[2]
                 if hit is not None:
                     extend_to = (e[0] + dx * hit[0], e[1] + dy * hit[0])
                     extend_len = hit[0]
                     ref_layer = hit[1]
+                    mode = "ray"
+                else:
+                    # 顺着方向会超出上限（或根本打不到）：改用**垂线段**补齐。
+                    # 垂足到端点的距离就是最近距离 d（≤ 上限），必然合规。
+                    fx, fy = foot_on_seg(e, best[4], best[5])
+                    extend_to = (fx, fy)
+                    extend_len = math.hypot(fx - e[0], fy - e[1])
+                    mode = "perp"
+                    if first_t is not None and first_t > thr_mm:
+                        reason = ("方向偏了（要延伸 %.2fmm），已改用垂线补齐"
+                                  % first_t)
+                    else:
+                        reason = "方向打不到线，已改用垂线补齐"
                 issues.append({
                     "layer": lname,
                     "addr": list(sp["addr"]),
@@ -147,6 +182,8 @@ def analyze(geo, mode, thr_mm, boundary_layers=("边界",), eps_mm=EPS_MM,
                     "ref_addr": list(ref_addr),
                     "extend_to": (round(extend_to[0], 4), round(extend_to[1], 4)) if extend_to else None,
                     "extend_len_mm": round(extend_len, 3) if extend_len else None,
+                    "reason": reason,
+                    "mode": mode,
                 })
     issues.sort(key=lambda x: (x["layer"], x["dist_mm"]))
     return issues
