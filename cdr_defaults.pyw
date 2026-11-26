@@ -2559,7 +2559,7 @@ class FloatWindow(object):
         self.ver_lb.pack(side="left")
 
         tk.Label(row, text="内测版 · 开发者：黄双成", bg=BG, fg=MUTED,
-                 font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(6, 0))
+                 font=("Microsoft YaHei UI", 6)).pack(side="left", padx=(5, 2))
         self.ver_lb.bind("<Button-1>", lambda e: self._on_ver_click())
 
         self.ver_btn = tk.Label(row, text="⟳", bg=BG, fg=MUTED, font=FONT, padx=8,
