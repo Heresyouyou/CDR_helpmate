@@ -163,7 +163,7 @@ def log(msg):
 
 
 # ---------------------------------------------------------------- 版本与更新
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 # 内网优先：先探 kust.work，通了就用内网源，不通才回落到公网 sjck.kust.work。
 # 两个地址都能用环境变量覆盖，方便调试或换镜像。
@@ -2557,6 +2557,9 @@ class FloatWindow(object):
         self.ver_lb = tk.Label(row, text="版本 v%s" % APP_VERSION, bg=BG, fg=MUTED,
                                font=FONT_S, cursor="hand2")
         self.ver_lb.pack(side="left")
+
+        tk.Label(row, text="内测版 · 开发者：黄双成", bg=BG, fg=MUTED,
+                 font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(6, 0))
         self.ver_lb.bind("<Button-1>", lambda e: self._on_ver_click())
 
         self.ver_btn = tk.Label(row, text="⟳", bg=BG, fg=MUTED, font=FONT, padx=8,
