@@ -358,3 +358,78 @@ def analyze(geo, mode, thr_mm, boundary_layers=("边界",), eps_mm=EPS_MM,
                 })
     issues.sort(key=lambda x: (x["layer"], x["dist_mm"]))
     return issues
+
+
+def analyze_open_ends(geo, tol_mm=0.5, eps_mm=0.005, cell=1.0):
+    """找出所有「悬空端点」：开放子路径的端点，离最近线条在 (eps, tol] 之间。
+
+    为什么以端点为准：一条线如果端头没接到任何东西，它两侧就是同一片区域，
+    智能填色必然从端头绕过去（这就是南温河断裂溢出的原因）。接上端头，
+    这片区域才会被真正分开。相比之下「面内窄颈」只能看到已经成面的地方。
+    """
+    segs = []
+    for layer, paths in geo.items():
+        for p in paths:
+            pts = p["pts"]
+            key = (layer, tuple(p["addr"]), p["sub"])
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-7:
+                    segs.append((key, a, b))
+    if not segs:
+        return []
+
+    grid = {}
+    for idx, (_k, a, b) in enumerate(segs):
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+            for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                grid.setdefault((gx, gy), []).append(idx)
+
+    out = []
+    for layer, paths in geo.items():
+        for p in paths:
+            if p["closed"] or len(p["pts"]) < 2:
+                continue
+            key = (layer, tuple(p["addr"]), p["sub"])
+            pts = p["pts"]
+            for end, pt in ((1, pts[-1]), (0, pts[0])):
+                gx, gy = int(pt[0] // cell), int(pt[1] // cell)
+                best = None
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for idx in grid.get((gx + dx, gy + dy), ()):
+                            k2, a, b = segs[idx]
+                            if k2 == key:
+                                continue
+                            vx, vy = b[0] - a[0], b[1] - a[1]
+                            l2 = vx * vx + vy * vy
+                            if l2 <= 1e-18:
+                                proj = a
+                            else:
+                                t = ((pt[0] - a[0]) * vx + (pt[1] - a[1]) * vy) / l2
+                                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                                proj = (a[0] + t * vx, a[1] + t * vy)
+                            d = math.hypot(pt[0] - proj[0], pt[1] - proj[1])
+                            if best is None or d < best[0]:
+                                best = (d, k2, proj)
+                if best is None:
+                    continue
+                d, (ol, oaddr, osub), proj = best
+                if d <= eps_mm or d > tol_mm:
+                    continue
+                out.append({
+                    "kind": "end",
+                    "layer": layer, "addr": list(p["addr"]), "sub": p["sub"],
+                    "end": end, "pt": (round(pt[0], 4), round(pt[1], 4)),
+                    "dist_mm": round(d, 4),
+                    "ref_layer": ol, "ref_addr": list(oaddr),
+                    "extend_to": (round(proj[0], 4), round(proj[1], 4)),
+                    "extend_len_mm": round(d, 4),
+                    "mode": "perp",
+                    "reason": "端头离最近线条 %.3fmm" % d,
+                    "low_risk": False, "parallel": False, "cluster_n": 1,
+                })
+    out.sort(key=lambda x: x["dist_mm"])
+    return out

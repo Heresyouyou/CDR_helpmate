@@ -1595,34 +1595,20 @@ class CdrBridge(object):
         if eps_mm:
             kw["eps_mm"] = float(eps_mm)
         issues = linecheck.analyze(self._line_geo, mode, thr_mm, boundary_layers=refs, **kw)
-        # 窄颈检测：优先用「分面」法（按智能填色的原理，一个面里找窄通道），
-        # 拿不到面（比如没有闭合外框）再退回逐对线段比较。
+        # 智能填色的原理：曲线必须真正相交/接触才成「面」。
+        # 所以真正导致溢出的只有一种情况——线的端头悬空（没接到任何线上），
+        # 填色从端头绕过去，把两侧并成一片。这里按「端头」找，一处只报一次。
         gaps = []
         self._faces_n = 0
-        if facemod is not None:
-            try:
-                gaps, nf = facemod.find_pinches(
-                    self._line_geo, thr_mm,
-                    eps_mm=float(eps_mm or linecheck.EPS_MM))
-                self._faces_n = nf
-                log("分面: %d 个面, 窄颈 %d 处" % (nf, len(gaps)))
-            except Exception as exc:
-                log("分面检测失败: %r" % (exc,))
-                gaps = []
-        if not gaps:
-            try:
-                gaps = linecheck.analyze_gaps(self._line_geo, thr_mm,
-                                              eps_mm=float(eps_mm or linecheck.EPS_MM))
-                self._faces_n = 0
-            except Exception as exc:
-                log("近缝检测失败: %r" % (exc,))
-                gaps = []
-        # 分面成功时，真正会漏的地方必然表现为「面内窄颈」，
-        # 端点类清单就成了重复项 —— 只报窄颈，避免无谓修复。
-        if getattr(self, "_faces_n", 0) >= 2 and gaps:
-            allx = list(gaps)
-        else:
-            allx = list(issues) + list(gaps)
+        try:
+            gaps = linecheck.analyze_open_ends(self._line_geo, tol_mm=thr_mm,
+                                               eps_mm=float(eps_mm or linecheck.EPS_MM))
+            log("悬空端点 %d 处" % len(gaps))
+        except Exception as exc:
+            log("端点检测失败: %r" % (exc,))
+            gaps = []
+        # 只报「悬空端头」：一类问题、一处一次，不再叠加重叠的点
+        allx = list(gaps) if gaps else list(issues)
         allx.sort(key=lambda x: (x.get("kind") != "gap", x["dist_mm"]))
         for i, it in enumerate(allx, 1):
             it["no"] = i
@@ -3038,7 +3024,7 @@ class FloatWindow(object):
         self.eps_entry.pack(side="right", ipady=2)
         self._label(head, "下限", fg=MUTED, font=FONT_S).pack(side="right", padx=(0, 2))
 
-        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.05)))
+        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.2)))
         self.thr_entry = tk.Entry(head, textvariable=self.thr_var, font=FONT_S, width=4,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
@@ -3180,7 +3166,7 @@ class FloatWindow(object):
         try:
             v = float(self.thr_var.get().strip())
         except Exception:
-            v = 0.05
+            v = 0.2
         v = max(0.005, min(20.0, v))
         self.thr_var.set("%g" % v)
         try:

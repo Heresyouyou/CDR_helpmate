@@ -181,6 +181,34 @@ def enumerate_faces(nodes, edges):
     return faces
 
 
+def _loop_vertices(nodes, edges, loop_edges):
+    """按遍历顺序取出这个面的顶点序列。"""
+    pts = []
+    for ei in loop_edges:
+        u = edges[ei][0]
+        pts.append(nodes[u])
+    return pts
+
+
+def _sub_area(pts, i, j):
+    """把环从 i 走到 j，加上弦，围出的多边形面积。"""
+    n = len(pts)
+    poly = []
+    k = i
+    while True:
+        poly.append(pts[k])
+        if k == j:
+            break
+        k = (k + 1) % n
+    a = 0.0
+    m = len(poly)
+    for t in range(m):
+        x1, y1 = poly[t]
+        x2, y2 = poly[(t + 1) % m]
+        a += x1 * y2 - x2 * y1
+    return abs(a) / 2.0
+
+
 def face_narrowest(nodes, edges, loop_edges, thr_mm, cell=None, eps_mm=0.0):
     """面内所有「宽度在 (eps, thr] 之间」的窄颈。返回 [(d, e1, e2, p, q), ...]。"""
     cell = cell or max(thr_mm * 4, 0.5)
@@ -243,7 +271,7 @@ def _make_issue(edges, d, e1, e2, p, q, area):
     }
 
 
-def find_pinches(geo, thr_mm, eps_mm=0.005, min_area=0.5):
+def find_pinches(geo, thr_mm, eps_mm=0.005, min_area=0.5, min_region=1.0):
     """对每个面找狭窄通道：一个面里可能有多处，各自独立报。
 
     判据来自智能填色的原理：面被轮廓围住才成面；若一个面内部存在宽度
@@ -260,12 +288,23 @@ def find_pinches(geo, thr_mm, eps_mm=0.005, min_area=0.5):
         if not cands:
             continue
         cands.sort(key=lambda t: t[0])
+        verts = _loop_vertices(nodes, edges, loop)
+        pos = {ei: k for k, ei in enumerate(loop)}
         picked = []
         for d, e1, e2, p, q in cands:
             if any(math.hypot(p[0] - pp[0], p[1] - pp[1]) <= 0.3 for pp in picked):
                 continue
             if edges[e1][2] == edges[e2][2]:
                 continue
+            # 只有「在这里切一刀会分出两块像样的区域」才算真分隔；
+            # 切开后一边只是细条/尖角的，修了也没意义。
+            try:
+                a1 = _sub_area(verts, pos[e1], pos[e2])
+                a2 = abs(area) - a1
+                if min(a1, a2) < min_region:
+                    continue
+            except Exception:
+                pass
             picked.append(p)
             out.append(_make_issue(edges, d, e1, e2, p, q, area))
     out.sort(key=lambda x: x["dist_mm"])
