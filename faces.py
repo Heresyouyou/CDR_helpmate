@@ -56,7 +56,7 @@ def _closest(a1, a2, b1, b2):
     return min(cands, key=lambda pq: math.hypot(pq[0][0] - pq[1][0], pq[0][1] - pq[1][1]))
 
 
-def build_arrangement(geo, cell=1.0):
+def build_arrangement(geo, cell=1.0, snap_tol=0.01):
     """把折线切成以交点分段的边。返回 (nodes, edges)。
 
     edges: [(u, v, owner_key, ax, ay, bx, by)]
@@ -124,8 +124,61 @@ def build_arrangement(geo, cell=1.0):
             p = (a[0] + dx * t, a[1] + dy * t)
             cur = nid(*p)
             if prev is not None and cur != prev:
-                edges.append((prev, cur, owner, nodes[prev][0], nodes[prev][1], p[0], p[1]))
+                edges.append([prev, cur, owner, nodes[prev][0], nodes[prev][1], p[0], p[1]])
             prev = cur
+
+    # ---- 第二遍：把「落在其它边内部」的节点真正接上去 ----
+    # 只算交点是不够的：端点正好压在另一条线的中间、或两条线共线重叠时，
+    # 距离是 0 却没有交点，于是就变成"看着贴上、拓扑上断开"——智能填色会从这儿漏。
+    if snap_tol and snap_tol > 0:
+        egrid = {}
+        for k, e in enumerate(edges):
+            ax, ay, bx, by = e[3], e[4], e[5], e[6]
+            x0, x1 = (ax, bx) if ax <= bx else (bx, ax)
+            y0, y1 = (ay, by) if ay <= by else (by, ay)
+            for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+                for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                    egrid.setdefault((gx, gy), []).append(k)
+        extra = {}
+        for n, (px, py) in enumerate(nodes):
+            gx, gy = int(px // cell), int(py // cell)
+            for dx_ in (-1, 0, 1):
+                for dy_ in (-1, 0, 1):
+                    for k in egrid.get((gx + dx_, gy + dy_), ()):
+                        e = edges[k]
+                        if e[0] == n or e[1] == n:
+                            continue
+                        ax, ay, bx, by = e[3], e[4], e[5], e[6]
+                        vx, vy = bx - ax, by - ay
+                        l2 = vx * vx + vy * vy
+                        if l2 <= 1e-18:
+                            continue
+                        t = ((px - ax) * vx + (py - ay) * vy) / l2
+                        if not (1e-6 < t < 1 - 1e-6):
+                            continue
+                        d = abs((px - ax) * vy - (py - ay) * vx) / math.sqrt(l2)
+                        if d > snap_tol:
+                            continue
+                        extra.setdefault(k, set()).add(round(t, 9))
+        if extra:
+            new_edges = []
+            for k, e in enumerate(edges):
+                ts = extra.get(k)
+                if not ts:
+                    new_edges.append(tuple(e))
+                    continue
+                ax, ay, bx, by = e[3], e[4], e[5], e[6]
+                cuts = sorted(set([0.0, 1.0] + list(ts)))
+                prev = e[0]
+                for t in cuts[1:]:
+                    px = ax + (bx - ax) * t
+                    py = ay + (by - ay) * t
+                    cur = e[1] if t >= 1 - 1e-9 else nid(px, py)
+                    if cur != prev:
+                        new_edges.append((prev, cur, e[2],
+                                          nodes[prev][0], nodes[prev][1], px, py))
+                    prev = cur
+            edges = new_edges
     return nodes, edges
 
 
@@ -330,13 +383,16 @@ class _UF(object):
             self.p[ra] = rb
 
 
-def graph_stats(geo):
+def graph_stats(geo, snap_tol=0.0):
     """平面图拓扑量：V 节点 / E 边 / C 连通分量 / F 有界面。
+
+    snap_tol 默认 0：CDR 的智能填充要求曲线**精确接触**，任何 >0 的缝都是漏口；
+    以前用 0.01mm 吸附去算，等于把真实缺口当成已经连上，判据从根上就错了。
 
     欧拉公式：F = E - V + C。这个 F 就是「智能填色能填出多少块」的量化指标——
     修复前后比 F，增加才算真有效。
     """
-    nodes, edges = build_arrangement(geo)
+    nodes, edges = build_arrangement(geo, snap_tol=snap_tol)
     V, E = len(nodes), len(edges)
     uf = _UF(V)
     deg = {}
@@ -382,6 +438,28 @@ def dangling_ends(geo, tol_mm=0.2, eps_mm=0.005, cell=1.0, stats=None):
             for end, pt in ((0, p["pts"][0]), (1, p["pts"][-1])):
                 by_pt[(round(pt[0], 3), round(pt[1], 3))] = (layer, p["addr"], p["sub"], end)
 
+    # 断头链长度：从端点走到最近岔口，越长说明这条线本该越有分隔作用
+    adj = {}
+    for i, e in enumerate(edges):
+        adj.setdefault(e[0], []).append((e[1], i))
+        adj.setdefault(e[1], []).append((e[0], i))
+
+    def chain_len(start):
+        total = 0.0
+        cur = start
+        prev = None
+        for _ in range(5000):
+            nxt = [(v, i) for v, i in adj.get(cur, []) if v != prev]
+            if not nxt:
+                break
+            v, i = nxt[0]
+            a, b = nodes[edges[i][0]], nodes[edges[i][1]]
+            total += math.hypot(b[0] - a[0], b[1] - a[1])
+            if deg.get(v, 0) != 2:
+                break
+            prev, cur = cur, v
+        return total
+
     out = []
     for n, d in deg.items():
         if d != 1:
@@ -426,11 +504,12 @@ def dangling_ends(geo, tol_mm=0.2, eps_mm=0.005, cell=1.0, stats=None):
             "mode": "perp",
             "same_comp": bool(same),
             "gain_face": 1 if same else 0,
+            "chain_mm": round(chain_len(n), 2),
             "reason": ("同一片里断开，接上会多一个面" if same
                        else "跨片连接，接上不会多出可填的面"),
             "low_risk": (not same), "parallel": False, "cluster_n": 1,
         })
-    out.sort(key=lambda x: (not x["same_comp"], x["dist_mm"]))
+    out.sort(key=lambda x: (not x["same_comp"], -x.get("chain_mm", 0), x["dist_mm"]))
     return out
 
 
@@ -470,8 +549,11 @@ def validate_repairs(geo, issues):
         else:
             p["pts"].insert(0, tgt)
         f2 = graph_stats(work)["F"]
-        if f2 > base:
-            it["gain_face"] = f2 - base
+        # 微小缝隙（<0.05mm）在节点取整(0.001mm)时可能被合并掉，模拟看不出增面；
+        # 但按欧拉公式：同分量内把度=1 的端点接上，必然 F+1，这是解析结论。
+        analytic = (it.get("same_comp") and it.get("dist_mm", 9) < 0.05)
+        if f2 > base or analytic:
+            it["gain_face"] = max(1, f2 - base)
             base = f2
             it["will_gain"] = True
         else:
@@ -482,3 +564,127 @@ def validate_repairs(geo, issues):
             it["will_gain"] = False
             it["reason"] = "接上后不会多出面（与已有连接重复）"
     return issues
+
+
+def key_chain_ends(geo, min_chain=5.0, tol_mm=0.5, eps_mm=0.0, cell=1.0,
+                   marks=None, snap_tol=0.0):
+    """只找「会让一大片区域串在一起」的关键断头。
+
+    串面的特征：一条足够长的线（断层/地质界限）端头悬空，两侧属于同一个面。
+    所以判据不是缝隙多小，而是：
+      1. 这个端点属于一条长度 >= min_chain 的断头链；
+      2. 它位于一个大面内部（若有用户标注的「串面」多边形，则只取落在里面的）；
+      3. 接上它以后能让 F 增加（validate_repairs 二次确认）。
+    """
+    nodes, edges = build_arrangement(geo, snap_tol=snap_tol)
+    deg, adj = {}, {}
+    for i, e in enumerate(edges):
+        u, v = e[0], e[1]
+        deg[u] = deg.get(u, 0) + 1; deg[v] = deg.get(v, 0) + 1
+        adj.setdefault(u, []).append((v, i)); adj.setdefault(v, []).append((u, i))
+
+    def elen(i):
+        a, b = nodes[edges[i][0]], nodes[edges[i][1]]
+        return math.hypot(b[0]-a[0], b[1]-a[1])
+
+    def walk(start):
+        L, cur, prev = 0.0, start, None
+        for _ in range(5000):
+            nxt = [(v, i) for v, i in adj.get(cur, []) if v != prev]
+            if not nxt:
+                break
+            v, i = nxt[0]
+            L += elen(i)
+            if deg.get(v, 0) != 2:
+                return L, v
+            prev, cur = cur, v
+        return L, cur
+
+    # 面：给每个端点标注它所在的最大面面积
+    loops = enumerate_faces(nodes, edges)
+    face_area_of_node = {}
+    for area, loop in loops:
+        if area <= 0:
+            continue
+        for ei in loop:
+            e = edges[ei]
+            for n in (e[0], e[1]):
+                if area > face_area_of_node.get(n, 0):
+                    face_area_of_node[n] = area
+
+    def inside(pt, poly):
+        x, y = pt; c = False; j = len(poly)-1
+        for i in range(len(poly)):
+            xi, yi = poly[i]; xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (x < (xj-xi)*(y-yi)/(yj-yi+1e-18)+xi):
+                c = not c
+            j = i
+        return c
+
+    # 端点坐标 -> 原始子路径的 end 标记
+    by_pt = {}
+    for layer, paths in geo.items():
+        for p in paths:
+            if p["closed"] or len(p["pts"]) < 2:
+                continue
+            for end, pt in ((0, p["pts"][0]), (1, p["pts"][-1])):
+                by_pt[(round(pt[0], 3), round(pt[1], 3))] = (layer, p["addr"], p["sub"], end)
+
+    grid = {}
+    for i, e in enumerate(edges):
+        a, b = nodes[e[0]], nodes[e[1]]
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        for gx in range(int(x0//cell), int(x1//cell)+1):
+            for gy in range(int(y0//cell), int(y1//cell)+1):
+                grid.setdefault((gx, gy), []).append(i)
+
+    out = []
+    for n, d in deg.items():
+        if d != 1:
+            continue
+        L, terminal = walk(n)
+        if L < min_chain:
+            continue
+        pt = nodes[n]
+        if marks and not any(inside(pt, mp) for mp in marks):
+            continue
+        owner = by_pt.get((round(pt[0], 3), round(pt[1], 3)))
+        if owner is None:
+            continue
+        gx, gy = int(pt[0]//cell), int(pt[1]//cell)
+        best = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for i in grid.get((gx+dx, gy+dy), ()):
+                    u, v = edges[i][0], edges[i][1]
+                    if u == n or v == n:
+                        continue
+                    a, b = nodes[u], nodes[v]
+                    vx, vy = b[0]-a[0], b[1]-a[1]
+                    l2 = vx*vx+vy*vy
+                    if l2 <= 1e-18:
+                        continue
+                    t = ((pt[0]-a[0])*vx+(pt[1]-a[1])*vy)/l2
+                    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                    proj = (a[0]+t*vx, a[1]+t*vy)
+                    dd = math.hypot(pt[0]-proj[0], pt[1]-proj[1])
+                    if best is None or dd < best[0]:
+                        best = (dd, proj)
+        if best is None or best[0] < eps_mm or best[0] > tol_mm:
+            continue
+        layer, addr, sub, end = owner
+        out.append({
+            "kind": "end", "layer": layer, "addr": list(addr), "sub": sub, "end": end,
+            "pt": (round(pt[0], 4), round(pt[1], 4)),
+            "dist_mm": round(best[0], 4),
+            "extend_to": (round(best[1][0], 4), round(best[1][1], 4)),
+            "extend_len_mm": round(best[0], 4), "mode": "perp",
+            "chain_mm": round(L, 2), "face_area": round(face_area_of_node.get(n, 0), 1),
+            "chain_id": "%d_%d" % (min(n, terminal), max(n, terminal)),
+            "same_comp": True, "gain_face": 1, "cluster_n": 1,
+            "low_risk": False, "parallel": False,
+            "reason": "断头链 %.1fmm，位于 %.0fmm² 的大面里" % (L, face_area_of_node.get(n, 0)),
+        })
+    out.sort(key=lambda x: (-x["chain_mm"], x["dist_mm"]))
+    return out

@@ -163,7 +163,7 @@ def log(msg):
 
 
 # ---------------------------------------------------------------- 版本与更新
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 # 内网优先：先探 kust.work，通了就用内网源，不通才回落到公网 sjck.kust.work。
 # 两个地址都能用环境变量覆盖，方便调试或换镜像。
@@ -1581,7 +1581,7 @@ class CdrBridge(object):
             return None
 
     def scan_lines(self, mode, thr_mm, ref_layers=None, progress=None, force=False,
-                   eps_mm=None):
+                   eps_mm=None, min_chain=None, marks=None):
         if linecheck is None:
             return None, "缺少检测模块 linecheck.py"
         if self._line_geo is None or force:
@@ -1601,21 +1601,27 @@ class CdrBridge(object):
         gaps = []
         self._faces_n = 0
         self._graph = None
+        # 标注层是填充面，不能混进线稿图里
+        geo = {k: v for k, v in self._line_geo.items()
+               if k not in ("修复后仍出错", "检测标记")}
         try:
             if facemod is not None:
-                st = facemod.graph_stats(self._line_geo)
+                st = facemod.graph_stats(geo)
                 self._graph = st
-                gaps = facemod.dangling_ends(
-                    self._line_geo, tol_mm=thr_mm,
-                    eps_mm=float(eps_mm or linecheck.EPS_MM), stats=st)
+                # 只找关键点：长断头链的端头（短毛刺一律不报）
+                gaps = facemod.key_chain_ends(
+                    geo,
+                    min_chain=float(min_chain or self.cfg.get("min_chain_mm", 10.0)),
+                    tol_mm=thr_mm, eps_mm=0.0,
+                    marks=marks if mode == "marks" else None)
                 # 逐条模拟：只有真能让「可填面」+1 的才算有效
                 if gaps:
-                    facemod.validate_repairs(self._line_geo, gaps)
+                    facemod.validate_repairs(geo, gaps)
                 log("拓扑: F=%d 面, 悬空 %d, 容差内 %d"
                     % (st["F"], st["dangling"], len(gaps)))
             else:
                 gaps = linecheck.analyze_open_ends(
-                    self._line_geo, tol_mm=thr_mm,
+                    geo, tol_mm=thr_mm,
                     eps_mm=float(eps_mm or linecheck.EPS_MM))
         except Exception as exc:
             log("端点检测失败: %r" % (exc,))
@@ -1702,6 +1708,18 @@ class CdrBridge(object):
         try:
             x = self.mm_to_doc(it["extend_to"][0])
             y = self.mm_to_doc(it["extend_to"][1])
+            # 过冲 0.05mm：只"碰到"是相切，智能填充可能不认；穿过去才算真相交
+            try:
+                ex = self.mm_to_doc(it["pt"][0])
+                ey = self.mm_to_doc(it["pt"][1])
+                vx, vy = x - ex, y - ey
+                n = math.hypot(vx, vy)
+                if n > 1e-9:
+                    push = self.mm_to_doc(0.05)
+                    x += vx / n * push
+                    y += vy / n * push
+            except Exception:
+                pass
             if end == 1:
                 sp.AppendLineSegment(x, y)
             else:
@@ -1865,6 +1883,34 @@ class CdrBridge(object):
         except Exception as exc:
             log("对面线插节点失败（不影响闭合）: %r" % (exc,))
         return True, "已吸附 %.3f mm" % (it.get("dist_mm") or 0)
+
+    def read_mark_polys(self):
+        """读「修复后仍出错」图层里每个填充对象的最大闭合轮廓（毫米）。"""
+        out = []
+        try:
+            page = self.doc.ActivePage
+            for li in range(1, int(page.Layers.Count) + 1):
+                L = page.Layers.Item(li)
+                if "修复后仍出错" not in str(L.Name):
+                    continue
+                for i in range(1, int(L.Shapes.Count) + 1):
+                    sh = L.Shapes.Item(i)
+                    try:
+                        c = sh.Curve
+                        best = []
+                        for si in range(1, int(c.SubPaths.Count) + 1):
+                            sp = c.SubPaths.Item(si)
+                            pts = [(float(n.PositionX) * 25.4, float(n.PositionY) * 25.4)
+                                   for n in sp.GetCurveInfo()]
+                            if len(pts) > len(best):
+                                best = pts
+                        if len(best) >= 3:
+                            out.append(best)
+                    except Exception:
+                        continue
+        except Exception as exc:
+            log("读标注层失败: %r" % (exc,))
+        return out
 
     def select_shape(self, it):
         if it.get("kind") == "gap":
@@ -3029,34 +3075,38 @@ class FloatWindow(object):
     def _build_linescan(self, parent):
         head = tk.Frame(parent, bg=BG)
         head.pack(fill="x")
-        self._label(head, "线条检测", fg=MUTED, font=FONT_S).pack(side="left")
+        self._label(head, "拓扑闭合", fg=MUTED, font=FONT_S).pack(side="left")
 
-        # 右侧从右往左：下限 [0.01] · 上限 [0.05] mm
-        self.eps_var = tk.StringVar(value="%g" % float(self.cfg.get("eps_mm", 0.005)))
-        self.eps_entry = tk.Entry(head, textvariable=self.eps_var, font=FONT_S, width=4,
+        prow = tk.Frame(parent, bg=BG)
+        prow.pack(fill="x", pady=(6, 0))
+
+        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("tol_mm", 0.5)))
+        self.thr_entry = tk.Entry(prow, textvariable=self.thr_var, font=FONT_S, width=5,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
                                   highlightbackground=LINE, highlightcolor=ACCENT)
-        self.eps_entry.pack(side="right", ipady=2)
-        self._label(head, "下限", fg=MUTED, font=FONT_S).pack(side="right", padx=(0, 2))
+        self._label(prow, "接点容差", fg=MUTED, font=FONT_S).pack(side="left")
+        self.thr_entry.pack(side="left", padx=(4, 2), ipady=2)
+        self._label(prow, "mm", fg=MUTED, font=FONT_S).pack(side="left")
 
-        self.thr_var = tk.StringVar(value="%g" % float(self.cfg.get("thr_mm", 0.2)))
-        self.thr_entry = tk.Entry(head, textvariable=self.thr_var, font=FONT_S, width=4,
+        self.eps_var = tk.StringVar(value="%g" % float(self.cfg.get("min_chain_mm", 10.0)))
+        self.eps_entry = tk.Entry(prow, textvariable=self.eps_var, font=FONT_S, width=5,
                                   justify="center", relief="flat", bg=FIELD_BG, fg=TXT,
                                   insertbackground=TXT, highlightthickness=1,
                                   highlightbackground=LINE, highlightcolor=ACCENT)
-        self._label(head, "mm", fg=MUTED, font=FONT_S).pack(side="right", padx=(6, 2))
-        self.thr_entry.pack(side="right", ipady=2)
+        self._label(prow, "最短链", fg=MUTED, font=FONT_S).pack(side="left", padx=(14, 0))
+        self.eps_entry.pack(side="left", padx=(4, 2), ipady=2)
+        self._label(prow, "mm", fg=MUTED, font=FONT_S).pack(side="left")
 
         row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", pady=(8, 0))
-        self.btn_bound = tk.Label(row, text="边界检测", bg=CHIP_BG, fg=TXT, font=FONT_S,
+        self.btn_bound = tk.Label(row, text="扫描关键点", bg=CHIP_BG, fg=TXT, font=FONT_S,
                                   pady=6, cursor="hand2")
         self.btn_bound.pack(side="left", fill="x", expand=True)
-        self.btn_global = tk.Label(row, text="全图闭合检测", bg=CHIP_BG, fg=TXT,
+        self.btn_global = tk.Label(row, text="只看标注层", bg=CHIP_BG, fg=TXT,
                                    font=FONT_S, pady=6, cursor="hand2")
         self.btn_global.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        for w, mode in ((self.btn_bound, "boundary"), (self.btn_global, "global")):
+        for w, mode in ((self.btn_bound, "topo"), (self.btn_global, "marks")):
             w.bind("<Button-1>", lambda e, m=mode: self._run_linescan(m))
             w.bind("<Enter>", lambda e, x=w: x.config(bg=CHIP_HOVER))
             w.bind("<Leave>", lambda e, x=w: x.config(bg=CHIP_BG))
@@ -3064,7 +3114,6 @@ class FloatWindow(object):
         self.ref_lb = tk.Label(parent, text="", bg=BG, fg=ACCENT, font=FONT_S,
                                anchor="w", cursor="hand2")
         self.ref_lb.pack(fill="x", pady=(6, 0))
-        self.ref_lb.bind("<Button-1>", lambda e: self._pick_ref_layers())
         self._paint_ref_layers()
 
     # ---- 参考图层选择 -----------------------------------------
@@ -3085,14 +3134,13 @@ class FloatWindow(object):
         return []
 
     def _paint_ref_layers(self):
+        g = getattr(self.bridge, "_graph", None)
+        if g:
+            txt = ("拓扑：V=%d E=%d C=%d  可填面 F=%d  悬空端 %d"
+                   % (g["V"], g["E"], g["C"], g["F"], g["dangling"]))
+        else:
+            txt = "拓扑：尚未扫描（接点容差 / 最短链可在上方调整）"
         try:
-            refs = self._ref_layers()
-            if not self.bridge.connected:
-                txt = "参考图层：—（未连接）"
-            elif refs:
-                txt = "参考图层：%s ▾" % "、".join(refs if len(refs) <= 3 else refs[:3] + ["…"])
-            else:
-                txt = "参考图层：未选（点击选择）"
             self.ref_lb.config(text=txt)
         except Exception:
             pass
@@ -3165,14 +3213,15 @@ class FloatWindow(object):
         tk.Button(bar, text="取消", command=top.destroy).pack(side="right", padx=6)
 
     def _eps_mm(self):
+        """最短断头链长（mm）：短于这个的一律不报。"""
         try:
             v = float(self.eps_var.get().strip())
         except Exception:
-            v = 0.005
-        v = max(0.0, min(1.0, v))
+            v = 10.0
+        v = max(0.0, min(200.0, v))
         self.eps_var.set("%g" % v)
         try:
-            self.cfg["eps_mm"] = v
+            self.cfg["min_chain_mm"] = v
             self._save_cfg()
         except Exception:
             pass
@@ -3186,7 +3235,7 @@ class FloatWindow(object):
         v = max(0.005, min(20.0, v))
         self.thr_var.set("%g" % v)
         try:
-            self.cfg["thr_mm"] = v
+            self.cfg["tol_mm"] = v
             self._save_cfg()
         except Exception:
             pass
@@ -3211,24 +3260,24 @@ class FloatWindow(object):
             self.set_status("没有打开的文档", "warn")
             return
 
-        thr = self._thr_mm()
-        eps = self._eps_mm()
-        title = "边界检测" if mode == "boundary" else "全图闭合检测"
-        refs = self._ref_layers()
-        if mode == "boundary":
-            if not refs:
-                messagebox.showwarning(title, "请先点「参考图层」选择至少一个图层")
+        thr = self._thr_mm()          # 接点容差
+        chain = self._eps_mm()        # 最短断头链
+        title = "只看标注层" if mode == "marks" else "扫描关键点"
+        marks = None
+        if mode == "marks":
+            marks = self.bridge.read_mark_polys()
+            if not marks:
+                messagebox.showwarning(title, "文档里没有「修复后仍出错」图层，或该图层没有填充面。")
                 return
-            tip = ("检查所有开放线条的端点，是否贴在「%s」的线条上却没接住\n"
-                   "（缝隙 %.3f ~ %.2f mm；小于 %.3f mm 视为已闭合）"
-                   % ("、".join(refs), eps, thr, eps))
-        else:
-            tip = ("检查所有开放线条的端点，是否贴在别的线条上却没接住\n"
-                   "（缝隙 %.3f ~ %.2f mm；小于 %.3f mm 视为已闭合）" % (eps, thr, eps))
-        if not messagebox.askyesno(title, tip + "\n\n"
-                                   "· 只检测有端点的线条，闭合线不参与\n"
-                                   "· 首次扫描要复制一份矢量做几何分析，约 1 分钟\n"
-                                   "· 不改原图：先标红圈，再逐条确认是否延长\n\n开始？"):
+        tip = ("按拓扑关系找「长断头链」的端点：\n\n"
+               "· 最短断头链 %.0f mm（短于此的毛刺不报）\n"
+               "· 接点容差 %.2f mm（缝隙大于 0 就算漏口）\n"
+               "· 每条修复先模拟验证，只有能多出一个可填面(F+1)的才保留\n"
+               "%s" % (chain, thr,
+                       "· 本次只取落在标注串面内的端点\n" if mode == "marks" else ""))
+        if not messagebox.askyesno(title, tip + "\n"
+                                   "· 首次扫描要采集矢量几何，约 1 分钟\n"
+                                   "· 不改原图：先标红圈，再逐条确认\n\n开始？"):
             return
 
         self._busy = True
@@ -3241,8 +3290,9 @@ class FloatWindow(object):
             dlg.check()
 
         try:
-            issues, err = self.bridge.scan_lines(mode, thr, ref_layers=refs,
-                                                 progress=progress, eps_mm=eps)
+            issues, err = self.bridge.scan_lines(mode, thr, ref_layers=None,
+                                                 progress=progress, eps_mm=0.0,
+                                                 min_chain=chain, marks=marks)
             dlg.set(0.97, "正在比对端点…")
         except Cancelled:
             cancelled = True
@@ -3260,8 +3310,8 @@ class FloatWindow(object):
             messagebox.showwarning(title, err or "检测失败")
             return
         if not issues:
-            self.set_status("没有发现未闭合端点（阈值 %.2f mm）" % thr, "ok", hold=8)
-            messagebox.showinfo(title, "没有发现未闭合端点。\n阈值 %.2f mm 内都接上了。" % thr)
+            self.set_status("没有找到关键点（最短链 %.0fmm，容差 %.2fmm）" % (chain, thr), "ok", hold=8)
+            messagebox.showinfo(title, "这个条件下没有长断头链需要补。")
             return
 
         dlg2 = ProgressDialog(self, title, "正在标注端点…")
@@ -3291,8 +3341,9 @@ class FloatWindow(object):
         g = getattr(self.bridge, "_graph", None)
         if g:
             eff = sum(1 for i in issues if i.get("will_gain"))
-            self.set_status("%s：%d 处（有效 %d）· 当前可填面 F=%d，修完可到 %d"
-                            % (title, len(issues), eff, g["F"], g["F"] + eff),
+            longest = max([i.get("chain_mm", 0) for i in issues] or [0])
+            self.set_status("%s：关键点 %d（有效 %d，最长断头链 %.0fmm）· F=%d→%d"
+                            % (title, len(issues), eff, longest, g["F"], g["F"] + eff),
                             "ok", hold=12)
         else:
             self.set_status("%s：%d 处" % (title, len(issues)), "ok", hold=10)
@@ -3319,8 +3370,8 @@ class FloatWindow(object):
         base_f = g["F"] if g else 0
         if not messagebox.askyesno(
                 "一键闭合",
-                "将对 %d 处「同一片里断开的线头」执行闭合：\n\n"
-                "· 当前可填面 F = %d，每修一处 +1，修完约 %d\n"
+                "将对 %d 个关键端点（按断头链成对处理）执行闭合：\n\n"
+                "· 当前可填面 F = %d，长链两端都补上才会 +1，修完约 %d\n"
                 "· 另有 %d 处接上后不会多出面（跨片或与已有连接重复），跳过\n\n"
                 "动手前会自动备份，完成后可用底栏「撤销」一次性回退。\n\n继续？"
                 % (len(targets), base_f, base_f + len(targets), len(low))):
@@ -3422,10 +3473,10 @@ class FloatWindow(object):
 
         def fmt(it):
             if it.get("kind") == "end":
-                mark = "→" if it.get("same_comp") else "·"
-                return "%s%02d  %-8s %-3s %6.3fmm  (%.1f, %.1f)" % (
-                    mark, it["no"], it["layer"], "尾端" if it["end"] else "首端",
-                    it["dist_mm"], it["pt"][0], it["pt"][1])
+                mark = "→" if it.get("will_gain") else "·"
+                return "%s%02d  %-7s 链%4.0fmm 面%4.0f 缝%5.3f  (%.0f,%.0f)" % (
+                    mark, it["no"], it["layer"], it.get("chain_mm", 0),
+                    it.get("face_area", 0), it["dist_mm"], it["pt"][0], it["pt"][1])
             if it.get("kind") == "gap":
                 if it.get("parallel"):
                     mark, tail = "∥", "疑似重复"
