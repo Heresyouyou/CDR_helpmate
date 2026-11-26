@@ -309,3 +309,176 @@ def find_pinches(geo, thr_mm, eps_mm=0.005, min_area=0.5, min_region=1.0):
             out.append(_make_issue(edges, d, e1, e2, p, q, area))
     out.sort(key=lambda x: x["dist_mm"])
     return out, len(faces)
+
+
+# ---------------------------------------------------------------- 拓扑判据
+
+class _UF(object):
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, x):
+        p = self.p
+        while p[x] != x:
+            p[x] = p[p[x]]
+            x = p[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[ra] = rb
+
+
+def graph_stats(geo):
+    """平面图拓扑量：V 节点 / E 边 / C 连通分量 / F 有界面。
+
+    欧拉公式：F = E - V + C。这个 F 就是「智能填色能填出多少块」的量化指标——
+    修复前后比 F，增加才算真有效。
+    """
+    nodes, edges = build_arrangement(geo)
+    V, E = len(nodes), len(edges)
+    uf = _UF(V)
+    deg = {}
+    for e in edges:
+        u, v = e[0], e[1]
+        uf.union(u, v)
+        deg[u] = deg.get(u, 0) + 1
+        deg[v] = deg.get(v, 0) + 1
+    C = len({uf.find(i) for i in range(V)}) if V else 0
+    return {
+        "V": V, "E": E, "C": C, "F": E - V + C,
+        "dangling": sum(1 for d in deg.values() if d == 1),
+        "uf": uf, "nodes": nodes, "edges": edges, "deg": deg,
+    }
+
+
+def dangling_ends(geo, tol_mm=0.2, eps_mm=0.005, cell=1.0, stats=None):
+    """拓扑意义上的悬空端头（度=1 的节点）+ 它接上去会不会真的多出一个面。
+
+    判据（欧拉）：把悬空端点连到**同一连通分量**里的另一处 → E+1、C 不变 → F+1，多一个面；
+    连到**另一个分量** → E+1、C-1 → F 不变，白修。
+    """
+    st = stats or graph_stats(geo)
+    nodes, edges = st["nodes"], st["edges"]
+    deg, uf = st["deg"], st["uf"]
+    V = len(nodes)
+
+    grid = {}
+    for i, e in enumerate(edges):
+        a, b = nodes[e[0]], nodes[e[1]]
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+            for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                grid.setdefault((gx, gy), []).append(i)
+
+    # 端头坐标 -> (layer, addr, sub, end) 反查
+    by_pt = {}
+    for layer, paths in geo.items():
+        for p in paths:
+            if p["closed"] or len(p["pts"]) < 2:
+                continue
+            for end, pt in ((0, p["pts"][0]), (1, p["pts"][-1])):
+                by_pt[(round(pt[0], 3), round(pt[1], 3))] = (layer, p["addr"], p["sub"], end)
+
+    out = []
+    for n, d in deg.items():
+        if d != 1:
+            continue
+        pt = nodes[n]
+        owner = by_pt.get((round(pt[0], 3), round(pt[1], 3)))
+        if owner is None:
+            continue
+        gx, gy = int(pt[0] // cell), int(pt[1] // cell)
+        best = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for i in grid.get((gx + dx, gy + dy), ()):
+                    u, v = edges[i][0], edges[i][1]
+                    if u == n or v == n:
+                        continue
+                    a, b = nodes[u], nodes[v]
+                    vx, vy = b[0] - a[0], b[1] - a[1]
+                    l2 = vx * vx + vy * vy
+                    if l2 <= 1e-18:
+                        continue
+                    t = ((pt[0] - a[0]) * vx + (pt[1] - a[1]) * vy) / l2
+                    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                    proj = (a[0] + t * vx, a[1] + t * vy)
+                    dd = math.hypot(pt[0] - proj[0], pt[1] - proj[1])
+                    if best is None or dd < best[0]:
+                        best = (dd, i, proj, u)
+        if best is None:
+            continue
+        dd, ei, proj, tu = best
+        if dd <= eps_mm or dd > tol_mm:
+            continue
+        same = uf.find(n) == uf.find(tu)
+        layer, addr, sub, end = owner
+        out.append({
+            "kind": "end",
+            "layer": layer, "addr": list(addr), "sub": sub, "end": end,
+            "pt": (round(pt[0], 4), round(pt[1], 4)),
+            "dist_mm": round(dd, 4),
+            "extend_to": (round(proj[0], 4), round(proj[1], 4)),
+            "extend_len_mm": round(dd, 4),
+            "mode": "perp",
+            "same_comp": bool(same),
+            "gain_face": 1 if same else 0,
+            "reason": ("同一片里断开，接上会多一个面" if same
+                       else "跨片连接，接上不会多出可填的面"),
+            "low_risk": (not same), "parallel": False, "cluster_n": 1,
+        })
+    out.sort(key=lambda x: (not x["same_comp"], x["dist_mm"]))
+    return out
+
+
+def validate_repairs(geo, issues):
+    """逐条模拟修复，只有「真的让 F 增加」的才标记 will_gain。
+
+    做法：把端点接到目标点后重算 F（欧拉公式），逐条累加模拟，避免互相影响。
+    这条是整个方案里唯一能回答「修了到底有没有用」的判据。
+    """
+    work = {}
+    for layer, paths in geo.items():
+        work[layer] = [{"addr": p["addr"], "sub": p["sub"], "closed": p["closed"],
+                        "pts": list(p["pts"])} for p in paths]
+
+    def key_map(g):
+        m = {}
+        for layer, paths in g.items():
+            for p in paths:
+                m[(layer, tuple(p["addr"]), p["sub"])] = p
+        return m
+
+    base = graph_stats(work)["F"]
+    km = key_map(work)
+    for it in issues:
+        k = (it["layer"], tuple(it["addr"]), it["sub"])
+        p = km.get(k)
+        if p is None:
+            it["will_gain"] = False
+            continue
+        tgt = it["extend_to"]
+        # 端点已经就是目标点 → 无意义
+        if math.hypot(p["pts"][-1][0] - tgt[0], p["pts"][-1][1] - tgt[1]) < 1e-6 and it["end"] == 1:
+            it["will_gain"] = False
+            continue
+        if it["end"] == 1:
+            p["pts"].append(tgt)
+        else:
+            p["pts"].insert(0, tgt)
+        f2 = graph_stats(work)["F"]
+        if f2 > base:
+            it["gain_face"] = f2 - base
+            base = f2
+            it["will_gain"] = True
+        else:
+            if it["end"] == 1:
+                p["pts"].pop()
+            else:
+                p["pts"].pop(0)
+            it["will_gain"] = False
+            it["reason"] = "接上后不会多出面（与已有连接重复）"
+    return issues

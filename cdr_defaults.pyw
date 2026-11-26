@@ -1600,10 +1600,23 @@ class CdrBridge(object):
         # 填色从端头绕过去，把两侧并成一片。这里按「端头」找，一处只报一次。
         gaps = []
         self._faces_n = 0
+        self._graph = None
         try:
-            gaps = linecheck.analyze_open_ends(self._line_geo, tol_mm=thr_mm,
-                                               eps_mm=float(eps_mm or linecheck.EPS_MM))
-            log("悬空端点 %d 处" % len(gaps))
+            if facemod is not None:
+                st = facemod.graph_stats(self._line_geo)
+                self._graph = st
+                gaps = facemod.dangling_ends(
+                    self._line_geo, tol_mm=thr_mm,
+                    eps_mm=float(eps_mm or linecheck.EPS_MM), stats=st)
+                # 逐条模拟：只有真能让「可填面」+1 的才算有效
+                if gaps:
+                    facemod.validate_repairs(self._line_geo, gaps)
+                log("拓扑: F=%d 面, 悬空 %d, 容差内 %d"
+                    % (st["F"], st["dangling"], len(gaps)))
+            else:
+                gaps = linecheck.analyze_open_ends(
+                    self._line_geo, tol_mm=thr_mm,
+                    eps_mm=float(eps_mm or linecheck.EPS_MM))
         except Exception as exc:
             log("端点检测失败: %r" % (exc,))
             gaps = []
@@ -3272,9 +3285,14 @@ class FloatWindow(object):
                 pass
             self.set_status("已取消标注（检测结果未保留）", "warn", hold=8)
             return
-        nf = getattr(self.bridge, "_faces_n", 0)
-        self.set_status("%s：%d 处%s" % (title, len(issues),
-                                        ("（分面 %d 个）" % nf) if nf else ""), "ok", hold=10)
+        g = getattr(self.bridge, "_graph", None)
+        if g:
+            eff = sum(1 for i in issues if i.get("will_gain"))
+            self.set_status("%s：%d 处（有效 %d）· 当前可填面 F=%d，修完可到 %d"
+                            % (title, len(issues), eff, g["F"], g["F"] + eff),
+                            "ok", hold=12)
+        else:
+            self.set_status("%s：%d 处" % (title, len(issues)), "ok", hold=10)
         self._open_review(issues, mode, thr, n_mark)
 
     def _apply_all(self, issues, win=None):
@@ -3287,24 +3305,22 @@ class FloatWindow(object):
 
         gaps = [i for i in issues if i.get("kind") == "gap"]
         ends = [i for i in issues if i.get("kind") != "gap"]
-        par = [i for i in gaps if i.get("parallel")]
-        low = [i for i in gaps if i.get("low_risk") and not i.get("parallel")]
-        targets = [i for i in issues
-                   if not (i.get("kind") == "gap"
-                           and (i.get("parallel") or i.get("low_risk")))]
+        eff = [i for i in issues if i.get("will_gain")]
+        low = [i for i in issues if i.get("kind") == "end" and not i.get("will_gain")]
+        par = []
+        targets = eff
         if not targets:
-            messagebox.showinfo("一键闭合", "剩下的都是疑似重复线，已跳过。")
+            messagebox.showinfo("一键闭合", "没有可自动修复的项（剩下的都是跨片连接）。")
             return
+        g = getattr(self.bridge, "_graph", None)
+        base_f = g["F"] if g else 0
         if not messagebox.askyesno(
                 "一键闭合",
-                "将对剩余 %d 处执行闭合：\n\n"
-                "· 端点未接 %d 处 → 延长 / 垂线补齐\n"
-                "· 两线近缝 %d 处 → 插节点吸附（不新增对象）\n"
-                "· 跳过疑似重复线 %d 处\n"
-                "· 跳过低风险近缝 %d 处（两条线附近已经相交，漏进去的只是一薄片）\n\n"
+                "将对 %d 处「同一片里断开的线头」执行闭合：\n\n"
+                "· 当前可填面 F = %d，每修一处 +1，修完约 %d\n"
+                "· 另有 %d 处接上后不会多出面（跨片或与已有连接重复），跳过\n\n"
                 "动手前会自动备份，完成后可用底栏「撤销」一次性回退。\n\n继续？"
-                % (len(targets), len(ends), len(gaps) - len(par) - len(low),
-                   len(par), len(low))):
+                % (len(targets), base_f, base_f + len(targets), len(low))):
             return
 
         self._backup_for_batch("一键闭合")
@@ -3361,10 +3377,8 @@ class FloatWindow(object):
         self.set_status("%s闭合 %d 处，失败 %d 处" % (head, ok, fail),
                         "ok" if not fail else "warn", hold=10)
         detail = "%s一键闭合：成功 %d，失败 %d" % (head, ok, fail)
-        if par:
-            detail += "\n跳过疑似重复线 %d 处（建议人工核对）" % len(par)
         if low:
-            detail += "\n跳过低风险近缝 %d 处" % len(low)
+            detail += "\n跳过跨片连接 %d 处（不增加可填面）" % len(low)
         if errs:
             detail += "\n\n失败示例：\n" + "\n".join(errs)
         detail += "\n\n可用底栏「撤销」一次性回退。"
@@ -3404,6 +3418,11 @@ class FloatWindow(object):
         cur = {"i": 0, "backed": False}
 
         def fmt(it):
+            if it.get("kind") == "end":
+                mark = "→" if it.get("same_comp") else "·"
+                return "%s%02d  %-8s %-3s %6.3fmm  (%.1f, %.1f)" % (
+                    mark, it["no"], it["layer"], "尾端" if it["end"] else "首端",
+                    it["dist_mm"], it["pt"][0], it["pt"][1])
             if it.get("kind") == "gap":
                 if it.get("parallel"):
                     mark, tail = "∥", "疑似重复"
